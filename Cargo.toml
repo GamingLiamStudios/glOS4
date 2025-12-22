@@ -1,0 +1,14 @@
+[package]
+name = "glOS"
+version = "0.1.0"
+edition = "2024"
+authors = ["GLStudios <58615717+GamingLiamStudios@users.noreply.github.com>"]
+license = "GPL2.0"
+
+[lints.clippy]
+enum_glob_use = "deny"
+pedantic = "deny"
+nursery = "deny"
+unwrap_used = "deny"
+perf = "deny"
+all = "deny"
