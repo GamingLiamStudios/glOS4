@@ -3,7 +3,13 @@ name = "glOS"
 version = "0.1.0"
 edition = "2024"
 authors = ["GLStudios <58615717+GamingLiamStudios@users.noreply.github.com>"]
-license = "GPL2.0"
+license = "GPL-2.0-only"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
 
 [lints.clippy]
 enum_glob_use = "deny"

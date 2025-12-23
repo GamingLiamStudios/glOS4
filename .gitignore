@@ -3,5 +3,7 @@
 .vs
 .vscode
 
-# Rust
+# Build Artifacts
 target
+iso_root
+*.iso
