@@ -11,6 +11,14 @@ panic = "abort"
 [profile.release]
 panic = "abort"
 
+[dependencies]
+acpi = "6.0"
+raw-cpuid = "11.6"
+x86_64 = "0.15"
+
+spin = "0.9"
+lazy_static = { version = "1.5", features = ["spin_no_std"] }
+
 [lints.clippy]
 enum_glob_use = "deny"
 pedantic = "deny"

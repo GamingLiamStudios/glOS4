@@ -91,7 +91,7 @@ ignore = [
 # [possible values: any SPDX 3.11 short identifier (+ optional exception)].
 allow = [
     "GPL-2.0-only",
-    #"MIT",
+    "MIT",
     #"GPL-2.0-or-later",
     #"LGPL-2.0-or-later",
     #"BSD-3-Clause",

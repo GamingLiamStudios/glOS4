@@ -43,7 +43,7 @@ impl BaseRevision {
 
 pub struct FullResponse<T> {
     pub revision: u64,
-    pub data:     T,
+    data:         T,
 }
 
 impl<T> Deref for FullResponse<T> {
@@ -153,7 +153,6 @@ pub struct FramebufferDescriptor {
     pub edid:      Option<NonNull<c_void>>,
 }
 
-#[derive(Default)]
 #[repr(C)]
 pub struct FramebufferInfo {}
 impl ImplRequest for FramebufferInfo {
@@ -161,4 +160,88 @@ impl ImplRequest for FramebufferInfo {
 
     const ID: [u64; 2] = [0x9d58_27dc_d881_dd75, 0xa314_8604_f6fa_b11b];
     const REVISION: u64 = 0; // TODO: Support rev1
+}
+
+#[repr(C)]
+pub struct MemoryMapResponse {
+    entry_count: u64,
+    entries:     NonNull<NonNull<MemoryMapEntry>>,
+}
+impl MemoryMapResponse {
+    pub fn entries(&self) -> &[NonNull<MemoryMapEntry>] {
+        let Ok(entry_count) = usize::try_from(self.entry_count) else {
+            unreachable!("Limine only supports 64-bit systems")
+        };
+        unsafe { core::slice::from_raw_parts(self.entries.as_ptr(), entry_count) }
+    }
+}
+
+#[repr(C)]
+pub struct MemoryMapEntry {
+    pub base:   u64,
+    pub length: u64,
+    pub typ:    MemoryMapEntryType,
+}
+
+#[repr(u64)]
+#[derive(PartialEq, Eq)]
+pub enum MemoryMapEntryType {
+    Usable = 0,
+    Reserved = 1,
+    AcpiReclaimable = 2,
+    AcpiNonVolatile = 3,
+    BadMemory = 4,
+    BootloaderReclaimable = 5,
+    ExecutableAndModules = 6,
+    Framebuffer = 7,
+    AcpiTables = 8,
+}
+
+#[repr(C)]
+pub struct MemoryMap {}
+impl ImplRequest for MemoryMap {
+    type Response = MemoryMapResponse;
+
+    const ID: [u64; 2] = [0x67cf_3d9d_378a_806f, 0xe304_acdf_c50c_3c62];
+    const REVISION: u64 = 0;
+}
+
+#[repr(C)]
+pub struct RdspResponse {
+    pub address: NonNull<c_void>,
+}
+
+pub struct RdspRequest {}
+impl ImplRequest for RdspRequest {
+    type Response = RdspResponse;
+
+    const ID: [u64; 2] = [0xc5e7_7b6b_397e_7b43, 0x2763_7845_accd_cf3c];
+    const REVISION: u64 = 0;
+}
+
+#[repr(C)]
+pub struct HddmResponse {
+    pub offset: u64,
+}
+
+pub struct HddmRequest {}
+impl ImplRequest for HddmRequest {
+    type Response = HddmResponse;
+
+    const ID: [u64; 2] = [0x48dc_f1cb_8ad2_b852, 0x6398_4e95_9a98_244b];
+    const REVISION: u64 = 0;
+}
+
+#[repr(C)]
+pub struct ExecutableAddressResponse {
+    pub physical_base: u64,
+    pub virtual_base:  u64,
+}
+
+pub struct ExecutableAddress {}
+impl ImplRequest for ExecutableAddress {
+    type Response = ExecutableAddressResponse;
+
+    const ID: [u64; 2] = [0x71ba_7686_3cc5_5f63, 0xb264_4a48_c516_a487];
+    const REVISION: u64 = 0;
 }
