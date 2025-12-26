@@ -16,8 +16,8 @@ acpi = "6.0"
 raw-cpuid = "11.6"
 x86_64 = "0.15"
 
-spin = "0.9"
-lazy_static = { version = "1.5", features = ["spin_no_std"] }
+spin = "0.10"
+embedded-graphics = { version = "0.8", features = ["fixed_point"] }
 
 [lints.clippy]
 enum_glob_use = "deny"

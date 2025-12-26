@@ -41,6 +41,7 @@ impl BaseRevision {
     }
 }
 
+#[repr(C)]
 pub struct FullResponse<T> {
     pub revision: u64,
     data:         T,
@@ -66,8 +67,8 @@ pub struct Request<T: ImplRequest> {
     id:       [u64; 4],
     revision: u64,
 
-    response: UnsafeCell<*const FullResponse<T::Response>>,
-    data:     T,
+    pub response: *const FullResponse<T::Response>,
+    data:         T,
 }
 
 impl<T: ImplRequest> Request<T> {
@@ -80,14 +81,13 @@ impl<T: ImplRequest> Request<T> {
                 T::ID[1],
             ],
             revision: T::REVISION,
-            response: UnsafeCell::new(core::ptr::null()),
+            response: core::ptr::null(),
             data,
         }
     }
 
-    pub unsafe fn response(&self) -> Option<&FullResponse<T::Response>> {
-        let ptr = self.response.get();
-        unsafe { (*ptr).as_ref() }
+    pub const unsafe fn response(&self) -> Option<&FullResponse<T::Response>> {
+        unsafe { self.response.as_ref() }
     }
 }
 
@@ -127,9 +127,10 @@ pub enum FramebufferMemoryModel {
     Rgb = 1,
 }
 
+// TODO: Document
 #[repr(C)]
 pub struct FramebufferDescriptor {
-    pub address: NonNull<c_void>,
+    pub address: NonNull<u8>,
 
     pub width:          u64,
     pub height:         u64,
@@ -177,6 +178,7 @@ impl MemoryMapResponse {
 }
 
 #[repr(C)]
+#[derive(Debug)]
 pub struct MemoryMapEntry {
     pub base:   u64,
     pub length: u64,
@@ -184,7 +186,7 @@ pub struct MemoryMapEntry {
 }
 
 #[repr(u64)]
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum MemoryMapEntryType {
     Usable = 0,
     Reserved = 1,
