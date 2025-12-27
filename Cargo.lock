@@ -120,6 +120,7 @@ name = "glOS"
 version = "0.1.0"
 dependencies = [
  "acpi",
+ "bytemuck",
  "embedded-graphics",
  "raw-cpuid",
  "spin",

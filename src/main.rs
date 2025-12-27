@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+use alloc::rc::Rc;
 use core::{
     alloc::GlobalAlloc,
     cell::UnsafeCell,
@@ -36,23 +37,33 @@ use embedded_graphics::{
 use x86_64::{
     PhysAddr,
     VirtAddr,
+    instructions::tlb::Pcid,
     registers::control::Cr3,
-    structures::paging::{
-        FrameAllocator,
-        Mapper,
-        OffsetPageTable,
-        Page,
-        PageSize,
-        PageTable,
-        PageTableFlags,
-        PhysFrame,
-        Size4KiB,
-        Translate,
-        mapper::MapperFlush,
+    structures::{
+        paging::{
+            FrameAllocator,
+            Mapper,
+            OffsetPageTable,
+            Page,
+            PageSize,
+            PageTable,
+            PageTableFlags,
+            PhysFrame,
+            Size4KiB,
+            Translate,
+            mapper::MapperFlush,
+        },
+        port::{
+            PortRead,
+            PortWrite,
+        },
     },
 };
 
-use crate::limine::MemoryMapEntryType;
+use crate::{
+    framebuffer::FRAMEBUFFER,
+    limine::MemoryMapEntryType,
+};
 
 mod framebuffer;
 mod interrupts;
@@ -288,10 +299,6 @@ unsafe impl GlobalAlloc for Locked<BumpAllocator> {
     ) -> *mut u8 {
         let mut allocator = self.lock();
 
-        let Ok(head) = usize::try_from(allocator.head.as_u64()) else {
-            unreachable!()
-        };
-
         let Ok(align) = u64::try_from(layout.align()) else {
             unreachable!()
         };
@@ -300,7 +307,7 @@ unsafe impl GlobalAlloc for Locked<BumpAllocator> {
         allocator.head = allocator.head.align_up(align);
 
         let offset = allocator.head.as_u64() - prev_head.as_u64();
-        while allocator.avail < layout.size() + offset as usize {
+        while allocator.avail <= layout.size() + offset as usize {
             let Ok(avail) = u64::try_from(allocator.avail) else {
                 unreachable!()
             };
@@ -308,13 +315,14 @@ unsafe impl GlobalAlloc for Locked<BumpAllocator> {
             let page: Page<Size4KiB> = Page::containing_address(allocator.head + avail);
             let frame = unsafe { FRAME_ALLOCATOR.allocate_frame().expect("OOM!") };
 
-            // Incredibly unsafe to have both at the same time but :shrug:
             unsafe {
                 PAGE_TABLE
                     .map_to(
                         page,
                         frame,
-                        PageTableFlags::WRITABLE | PageTableFlags::PRESENT,
+                        PageTableFlags::WRITABLE
+                            | PageTableFlags::PRESENT
+                            | PageTableFlags::USER_ACCESSIBLE,
                         &mut FRAME_ALLOCATOR,
                     )
                     .expect("uh what")
@@ -330,6 +338,7 @@ unsafe impl GlobalAlloc for Locked<BumpAllocator> {
 
         let alloc_head = allocator.head;
         allocator.head += layout_size;
+        allocator.avail -= layout.size() + offset as usize;
 
         alloc_head.as_mut_ptr()
     }
@@ -347,16 +356,44 @@ unsafe impl GlobalAlloc for Locked<BumpAllocator> {
 static mut ALLOCATOR: Locked<BumpAllocator> =
     Locked::new(BumpAllocator::new(VirtAddr::new(0x8000_0000)));
 
-struct AcpiHandler {
-    virt_start: UnsafeCell<VirtAddr>,
+struct AcpiHandlerImpl {
+    virt_start: VirtAddr,
 }
 
-impl acpi::Handler for &AcpiHandler {
+#[derive(Clone)]
+struct AcpiHandler {
+    inner: Rc<UnsafeCell<AcpiHandlerImpl>>,
+}
+
+impl AcpiHandler {
+    pub fn new(inner: AcpiHandlerImpl) -> Self {
+        Self {
+            inner: Rc::new(UnsafeCell::new(inner)),
+        }
+    }
+
+    pub fn read_io_generic<T: PortRead>(port: u16) -> T {
+        let mut port = x86_64::instructions::port::Port::new(port);
+        unsafe { port.read() }
+    }
+
+    pub fn write_io_generic<T: PortWrite>(
+        port: u16,
+        value: T,
+    ) {
+        let mut port = x86_64::instructions::port::Port::new(port);
+        unsafe { port.write(value) }
+    }
+}
+
+impl acpi::Handler for AcpiHandler {
     unsafe fn map_physical_region<T>(
         &self,
         physical_address: usize,
         size: usize,
     ) -> acpi::PhysicalMapping<Self, T> {
+        let handler = unsafe { &mut *self.inner.get() };
+
         let Ok(phys_addr) = u64::try_from(physical_address) else {
             unreachable!()
         };
@@ -370,7 +407,7 @@ impl acpi::Handler for &AcpiHandler {
 
         let mapped_bytes = (size_u64 + offset).next_multiple_of(4096);
 
-        let virt_start = unsafe { &mut *self.virt_start.get() };
+        let virt_start = &mut handler.virt_start;
         let virt = *virt_start; // Assumes already page aligned
         *virt_start += mapped_bytes;
 
@@ -405,11 +442,11 @@ impl acpi::Handler for &AcpiHandler {
             virtual_start:  unsafe { NonNull::new_unchecked(virtual_address as *mut _) },
             region_length:  size,
             mapped_length:  mapped_bytes,
-            handler:        self,
+            handler:        self.clone(),
         }
     }
 
-    fn unmap_physical_region<T>(region: &acpi::PhysicalMapping<Self, T>) {
+    fn unmap_physical_region<T>(_region: &acpi::PhysicalMapping<Self, T>) {
         // For now; don't worry bout it :3
     }
 
@@ -417,28 +454,44 @@ impl acpi::Handler for &AcpiHandler {
         &self,
         address: usize,
     ) -> u8 {
-        todo!()
+        unsafe {
+            self.map_physical_region(address, size_of::<u8>())
+                .virtual_start
+                .read()
+        }
     }
 
     fn read_u16(
         &self,
         address: usize,
     ) -> u16 {
-        todo!()
+        unsafe {
+            self.map_physical_region(address, size_of::<u16>())
+                .virtual_start
+                .read()
+        }
     }
 
     fn read_u32(
         &self,
         address: usize,
     ) -> u32 {
-        todo!()
+        unsafe {
+            self.map_physical_region(address, size_of::<u32>())
+                .virtual_start
+                .read()
+        }
     }
 
     fn read_u64(
         &self,
         address: usize,
     ) -> u64 {
-        todo!()
+        unsafe {
+            self.map_physical_region(address, size_of::<u64>())
+                .virtual_start
+                .read()
+        }
     }
 
     fn write_u8(
@@ -446,7 +499,11 @@ impl acpi::Handler for &AcpiHandler {
         address: usize,
         value: u8,
     ) {
-        todo!()
+        unsafe {
+            self.map_physical_region(address, size_of::<u8>())
+                .virtual_start
+                .write(value);
+        }
     }
 
     fn write_u16(
@@ -454,7 +511,11 @@ impl acpi::Handler for &AcpiHandler {
         address: usize,
         value: u16,
     ) {
-        todo!()
+        unsafe {
+            self.map_physical_region(address, size_of::<u16>())
+                .virtual_start
+                .write(value);
+        }
     }
 
     fn write_u32(
@@ -462,7 +523,11 @@ impl acpi::Handler for &AcpiHandler {
         address: usize,
         value: u32,
     ) {
-        todo!()
+        unsafe {
+            self.map_physical_region(address, size_of::<u32>())
+                .virtual_start
+                .write(value);
+        }
     }
 
     fn write_u64(
@@ -470,28 +535,32 @@ impl acpi::Handler for &AcpiHandler {
         address: usize,
         value: u64,
     ) {
-        todo!()
+        unsafe {
+            self.map_physical_region(address, size_of::<u64>())
+                .virtual_start
+                .write(value);
+        }
     }
 
     fn read_io_u8(
         &self,
         port: u16,
     ) -> u8 {
-        todo!()
+        Self::read_io_generic(port)
     }
 
     fn read_io_u16(
         &self,
         port: u16,
     ) -> u16 {
-        todo!()
+        Self::read_io_generic(port)
     }
 
     fn read_io_u32(
         &self,
         port: u16,
     ) -> u32 {
-        todo!()
+        Self::read_io_generic(port)
     }
 
     fn write_io_u8(
@@ -499,7 +568,7 @@ impl acpi::Handler for &AcpiHandler {
         port: u16,
         value: u8,
     ) {
-        todo!()
+        Self::write_io_generic(port, value);
     }
 
     fn write_io_u16(
@@ -507,7 +576,7 @@ impl acpi::Handler for &AcpiHandler {
         port: u16,
         value: u16,
     ) {
-        todo!()
+        Self::write_io_generic(port, value);
     }
 
     fn write_io_u32(
@@ -515,7 +584,7 @@ impl acpi::Handler for &AcpiHandler {
         port: u16,
         value: u32,
     ) {
-        todo!()
+        Self::write_io_generic(port, value);
     }
 
     fn read_pci_u8(
@@ -608,6 +677,13 @@ impl acpi::Handler for &AcpiHandler {
 
 #[unsafe(no_mangle)]
 extern "C" fn _start() -> ! {
+    unsafe {
+        PAGE_TABLE = StaticPageTable::Offset(hddm_page_table());
+        interrupts::initalize_idt();
+
+        FRAMEBUFFER.init();
+    }
+
     assert!(
         BASE_REVISION.is_supported(),
         "Base Revision is not Supported!"
@@ -619,9 +695,6 @@ extern "C" fn _start() -> ! {
         let Some(_memory_map) = MEMORY_MAP.response() else {
             panic!("Unable to get MemoryMap from Limine");
         };
-
-        PAGE_TABLE = StaticPageTable::Offset(hddm_page_table());
-        interrupts::initalize_idt();
 
         // Get Maximum Physical Address Width (M)
         let cpuid = raw_cpuid::CpuId::new();
@@ -654,15 +727,18 @@ extern "C" fn _start() -> ! {
             addr_usize
         };
 
-        let handler = AcpiHandler {
-            virt_start: UnsafeCell::new(VirtAddr::new(0x6000_0000)),
-        };
+        let handler = AcpiHandler::new(
+            (AcpiHandlerImpl {
+                virt_start: VirtAddr::new(0x6000_0000),
+            }),
+        );
 
-        let Ok(acpi_tables) = AcpiTables::from_rsdp(&handler, rdsp_address) else {
+        let Ok(acpi_tables) = AcpiTables::from_rsdp(handler.clone(), rdsp_address) else {
             panic!("I really don't know what to do from here...");
         };
-        let platform = AcpiPlatform::new(acpi_tables, &handler).expect("aw :(");
+        let platform = AcpiPlatform::new(acpi_tables, handler).expect("aw :(");
         let interpreter = Interpreter::new_from_platform(&platform).expect("aw :((");
+        interpreter.initialize_namespace();
 
         println!("{}", interpreter.namespace.lock());
     }

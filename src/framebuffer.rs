@@ -1,4 +1,4 @@
-use alloc::string::String;
+use alloc::boxed::Box;
 
 use embedded_graphics::{
     Pixel,
@@ -6,7 +6,10 @@ use embedded_graphics::{
         MonoTextStyle,
         ascii::FONT_10X20,
     },
-    pixelcolor::Rgb888,
+    pixelcolor::{
+        Rgb888,
+        raw::ToBytes,
+    },
     prelude::{
         DrawTarget,
         Drawable,
@@ -40,8 +43,43 @@ fn framebuffer_info() -> &'static FramebufferDescriptor {
 
 pub struct UefiFramebuffer {
     current_line: usize,
+    pub buffer:   Option<Box<[u8]>>,
 }
-pub static mut FRAMEBUFFER: UefiFramebuffer = UefiFramebuffer { current_line: 0 };
+pub static mut FRAMEBUFFER: UefiFramebuffer = UefiFramebuffer {
+    current_line: 0,
+    buffer:       None,
+};
+
+impl UefiFramebuffer {
+    pub fn init(&mut self) {
+        let framebuffer = framebuffer_info();
+
+        let Ok(length) = usize::try_from(framebuffer.pitch * framebuffer.height) else {
+            unreachable!()
+        };
+
+        let buffer = Box::new_uninit_slice(length);
+        let mut buffer = unsafe { buffer.assume_init() };
+        buffer.fill(0x00);
+
+        self.buffer = Some(buffer);
+    }
+
+    pub fn flush(&mut self) {
+        let Some(buffer) = self.buffer.as_mut() else {
+            return;
+        };
+
+        let framebuffer = framebuffer_info();
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                buffer.as_ptr(),
+                framebuffer.address.as_ptr(),
+                buffer.len(),
+            );
+        }
+    }
+}
 
 impl DrawTarget for UefiFramebuffer {
     type Color = Rgb888;
@@ -55,6 +93,9 @@ impl DrawTarget for UefiFramebuffer {
         I: IntoIterator<Item = embedded_graphics::Pixel<Self::Color>>,
     {
         let framebuffer = framebuffer_info();
+        if self.buffer.is_none() {
+            //self.init();
+        }
 
         for Pixel(point, color) in pixels {
             let Ok(pixel_x) = u64::try_from(point.x) else {
@@ -69,13 +110,18 @@ impl DrawTarget for UefiFramebuffer {
             )
             .expect("Pixel Offset too large!");
 
-            unsafe {
-                let addr = framebuffer.address.byte_add(offset);
-                core::ptr::copy_nonoverlapping(
-                    (&raw const color).cast(),
-                    addr.as_ptr(),
-                    size_of_val(&color),
-                );
+            if let Some(buffer) = self.buffer.as_mut() {
+                buffer[offset..offset + color.to_ne_bytes().len()]
+                    .copy_from_slice(&color.to_ne_bytes());
+            } else {
+                unsafe {
+                    let addr = framebuffer.address.add(offset);
+                    core::ptr::copy_nonoverlapping(
+                        (&raw const color).cast(),
+                        addr.as_ptr(),
+                        size_of_val(&color),
+                    );
+                }
             }
         }
 
@@ -93,7 +139,11 @@ impl OriginDimensions for UefiFramebuffer {
     }
 }
 
-use core::fmt::Write;
+use core::{
+    cell::UnsafeCell,
+    fmt::Write,
+    mem::MaybeUninit,
+};
 
 // Simple wrapper to write into a byte buffer
 struct BufferWriter<'a> {
@@ -156,7 +206,26 @@ pub fn print(args: core::fmt::Arguments) {
             let sub_str = &line[start..end];
 
             unsafe {
-                let text_y = 20 + FRAMEBUFFER.current_line * 23;
+                let mut text_y = 20 + FRAMEBUFFER.current_line * 23;
+                if text_y + 20 >= FRAMEBUFFER.size().height as usize {
+                    text_y -= 23;
+
+                    if FRAMEBUFFER.buffer.is_none() {
+                        FRAMEBUFFER.init();
+                    }
+
+                    if let Some(buffer) = FRAMEBUFFER.buffer.as_mut() {
+                        let buffer_info = framebuffer_info();
+                        let clipped_start = buffer_info.pitch as usize * 23;
+                        buffer.copy_within(clipped_start..buffer.len(), 0);
+
+                        let len = buffer.len();
+                        buffer[len - clipped_start..].fill(0x00);
+                        FRAMEBUFFER.current_line -= 1;
+
+                        for _ in 0..100_000 {}
+                    }
+                }
 
                 _ = Text::new(
                     sub_str,
@@ -166,6 +235,7 @@ pub fn print(args: core::fmt::Arguments) {
                 .draw(&mut FRAMEBUFFER);
 
                 FRAMEBUFFER.current_line += 1;
+                FRAMEBUFFER.flush();
             }
         }
     }
