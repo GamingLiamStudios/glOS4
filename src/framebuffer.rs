@@ -1,3 +1,5 @@
+use alloc::string::String;
+
 use embedded_graphics::{
     Pixel,
     mono_font::{
@@ -142,20 +144,29 @@ macro_rules! println {
 }
 
 pub fn print(args: core::fmt::Arguments) {
-    let mut buffer = [0u8; 500];
+    let mut buffer = [0u8; 2048];
     let mut writer = BufferWriter::new(&mut buffer);
     _ = writer.write_fmt(args);
 
-    unsafe {
-        let text_y = 20 + FRAMEBUFFER.current_line * 23;
+    let max_chars = ((unsafe { FRAMEBUFFER.size().width } / 10) - 3) as usize;
 
-        _ = Text::new(
-            writer.as_str(),
-            Point::new(20, text_y as i32),
-            MonoTextStyle::new(&FONT_10X20, Rgb888::CSS_WHITE),
-        )
-        .draw(&mut FRAMEBUFFER);
+    for line in writer.as_str().lines() {
+        for start in (0..line.len()).step_by(max_chars) {
+            let end = core::cmp::min(start + max_chars, line.len());
+            let sub_str = &line[start..end];
 
-        FRAMEBUFFER.current_line += writer.as_str().lines().count();
+            unsafe {
+                let text_y = 20 + FRAMEBUFFER.current_line * 23;
+
+                _ = Text::new(
+                    sub_str,
+                    Point::new(20, text_y as i32),
+                    MonoTextStyle::new(&FONT_10X20, Rgb888::CSS_WHITE),
+                )
+                .draw(&mut FRAMEBUFFER);
+
+                FRAMEBUFFER.current_line += 1;
+            }
+        }
     }
 }

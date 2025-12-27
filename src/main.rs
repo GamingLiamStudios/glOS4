@@ -1,4 +1,4 @@
-#![feature(alloc_layout_extra)]
+#![feature(alloc_layout_extra, abi_x86_interrupt)]
 #![allow(static_mut_refs)]
 #![no_std]
 #![no_main]
@@ -55,6 +55,7 @@ use x86_64::{
 use crate::limine::MemoryMapEntryType;
 
 mod framebuffer;
+mod interrupts;
 mod limine;
 
 #[unsafe(link_section = ".limine_requests")]
@@ -620,6 +621,7 @@ extern "C" fn _start() -> ! {
         };
 
         PAGE_TABLE = StaticPageTable::Offset(hddm_page_table());
+        interrupts::initalize_idt();
 
         // Get Maximum Physical Address Width (M)
         let cpuid = raw_cpuid::CpuId::new();
@@ -687,16 +689,5 @@ extern "C" fn _start() -> ! {
     */
 
     #[allow(clippy::empty_loop)]
-    loop {}
-}
-
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-    if let Some(location) = info.location() {
-        println!("at {}\n {}", location, info.message());
-    } else {
-        println!("{}", info.message());
-    }
-
     loop {}
 }
