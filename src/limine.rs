@@ -1,9 +1,5 @@
 use core::{
-    cell::UnsafeCell,
-    ffi::{
-        CStr,
-        c_void,
-    },
+    ffi::c_void,
     ops::Deref,
     ptr::NonNull,
 };
@@ -93,6 +89,7 @@ impl<T: ImplRequest> Request<T> {
 
 unsafe impl<T: ImplRequest> Sync for Request<T> {}
 
+/*
 pub struct BootloaderInfoResponse {
     name:    NonNull<CStr>,
     version: NonNull<CStr>,
@@ -106,6 +103,7 @@ impl ImplRequest for BootloaderInfo {
     const ID: [u64; 2] = [0xf550_38d8_e2a1_202f, 0x2794_26fc_f5f5_9740];
     const REVISION: u64 = 0;
 }
+*/
 
 #[repr(C)]
 pub struct FramebufferResponse {

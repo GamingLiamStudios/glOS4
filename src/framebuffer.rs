@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use core::fmt::Write;
 
 use embedded_graphics::{
     Pixel,
@@ -139,12 +140,6 @@ impl OriginDimensions for UefiFramebuffer {
     }
 }
 
-use core::{
-    cell::UnsafeCell,
-    fmt::Write,
-    mem::MaybeUninit,
-};
-
 // Simple wrapper to write into a byte buffer
 struct BufferWriter<'a> {
     buffer:   &'a mut [u8],
@@ -183,17 +178,12 @@ impl core::fmt::Write for BufferWriter<'_> {
 }
 
 #[macro_export]
-macro_rules! print {
-    ($($arg:tt)*) => ($crate::framebuffer::print(format_args!($($arg)*)));
-}
-
-#[macro_export]
 macro_rules! println {
-    () => ($crate::print!("\n"));
-    ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
+    ($($arg:tt)*) => ($crate::framebuffer::println(format_args!($($arg)*)));
 }
 
-pub fn print(args: core::fmt::Arguments) {
+// TODO: Improve
+pub fn println(args: core::fmt::Arguments) {
     let mut buffer = [0u8; 2048];
     let mut writer = BufferWriter::new(&mut buffer);
     _ = writer.write_fmt(args);
@@ -216,7 +206,10 @@ pub fn print(args: core::fmt::Arguments) {
 
                     if let Some(buffer) = FRAMEBUFFER.buffer.as_mut() {
                         let buffer_info = framebuffer_info();
-                        let clipped_start = buffer_info.pitch as usize * 23;
+                        let Ok(pitch) = usize::try_from(buffer_info.pitch) else {
+                            unreachable!()
+                        };
+                        let clipped_start = pitch * 23;
                         buffer.copy_within(clipped_start..buffer.len(), 0);
 
                         let len = buffer.len();
@@ -227,15 +220,17 @@ pub fn print(args: core::fmt::Arguments) {
                     }
                 }
 
-                _ = Text::new(
-                    sub_str,
-                    Point::new(20, text_y as i32),
-                    MonoTextStyle::new(&FONT_10X20, Rgb888::CSS_WHITE),
-                )
-                .draw(&mut FRAMEBUFFER);
+                if let Ok(text_y) = i32::try_from(text_y) {
+                    _ = Text::new(
+                        sub_str,
+                        Point::new(20, text_y),
+                        MonoTextStyle::new(&FONT_10X20, Rgb888::CSS_WHITE),
+                    )
+                    .draw(&mut FRAMEBUFFER);
 
-                FRAMEBUFFER.current_line += 1;
-                FRAMEBUFFER.flush();
+                    FRAMEBUFFER.current_line += 1;
+                    FRAMEBUFFER.flush();
+                }
             }
         }
     }

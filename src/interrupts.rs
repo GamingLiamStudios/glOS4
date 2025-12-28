@@ -47,7 +47,9 @@ extern "x86-interrupt" fn page_fault_handler(
     let stack_bottom = rsp & !0xffff; // 64 KiB stack
     let stack_top = stack_bottom + 0x10000;
 
-    walk_stack(rbp, stack_bottom, stack_top, |frame| println!("{frame:X?}"));
+    walk_stack(rbp, stack_bottom, stack_top, |frame| {
+        println!("{frame:#08X?}");
+    });
 
     let cr2 = Cr2::read_raw();
 
@@ -64,13 +66,13 @@ fn generic_handler(
         FRAMEBUFFER.buffer = None;
     }
     panic!("Interrupt! {stack_frame:?} {index} {error_code:?}");
-    loop {}
 }
 
+#[allow(unused)]
 #[derive(Debug, Copy, Clone)]
 pub struct StackFrame {
-    pub rbp: u64,
-    pub rip: u64,
+    rbp: u64,
+    rip: u64,
 }
 
 pub fn walk_stack(

@@ -14,32 +14,9 @@ use core::{
 
 use acpi::{
     AcpiTables,
-    AmlTable,
     Handler,
     PciAddress,
-    aml::Interpreter,
-    platform::{
-        AcpiPlatform,
-        PciConfigRegions,
-        pci,
-    },
-    sdt::mcfg::McfgEntry,
-};
-use embedded_graphics::{
-    mono_font::{
-        MonoTextStyle,
-        ascii::{
-            FONT_6X10,
-            FONT_10X20,
-        },
-    },
-    pixelcolor::Rgb888,
-    prelude::{
-        Drawable,
-        Point,
-        WebColors,
-    },
-    text::Text,
+    platform::PciConfigRegions,
 };
 use pci_types::{
     ConfigRegionAccess,
@@ -49,7 +26,6 @@ use pci_types::{
 use x86_64::{
     PhysAddr,
     VirtAddr,
-    instructions::tlb::Pcid,
     registers::control::Cr3,
     structures::{
         paging::{
@@ -318,8 +294,11 @@ unsafe impl GlobalAlloc for Locked<BumpAllocator> {
         let prev_head = allocator.head;
         allocator.head = allocator.head.align_up(align);
 
-        let offset = allocator.head.as_u64() - prev_head.as_u64();
-        while allocator.avail <= layout.size() + offset as usize {
+        let Ok(offset) = usize::try_from(allocator.head.as_u64() - prev_head.as_u64()) else {
+            unreachable!()
+        };
+
+        while allocator.avail <= layout.size() + offset {
             let Ok(avail) = u64::try_from(allocator.avail) else {
                 unreachable!()
             };
@@ -350,7 +329,7 @@ unsafe impl GlobalAlloc for Locked<BumpAllocator> {
 
         let alloc_head = allocator.head;
         allocator.head += layout_size;
-        allocator.avail -= layout.size() + offset as usize;
+        allocator.avail -= layout.size() + offset;
 
         alloc_head.as_mut_ptr()
     }
@@ -733,14 +712,14 @@ impl acpi::Handler for AcpiHandler {
 
     fn stall(
         &self,
-        microseconds: u64,
+        _microseconds: u64,
     ) {
         todo!()
     }
 
     fn sleep(
         &self,
-        milliseconds: u64,
+        _milliseconds: u64,
     ) {
         todo!()
     }
@@ -751,15 +730,15 @@ impl acpi::Handler for AcpiHandler {
 
     fn acquire(
         &self,
-        mutex: acpi::Handle,
-        timeout: u16,
+        _mutex: acpi::Handle,
+        _timeout: u16,
     ) -> Result<(), acpi::aml::AmlError> {
         Ok(())
     }
 
     fn release(
         &self,
-        mutex: acpi::Handle,
+        _mutex: acpi::Handle,
     ) {
     }
 }
