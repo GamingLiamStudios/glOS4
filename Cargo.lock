@@ -122,6 +122,8 @@ dependencies = [
  "acpi",
  "bytemuck",
  "embedded-graphics",
+ "num-traits",
+ "pci_types",
  "raw-cpuid",
  "spin",
  "x86_64",

@@ -223,7 +223,7 @@ pub fn print(args: core::fmt::Arguments) {
                         buffer[len - clipped_start..].fill(0x00);
                         FRAMEBUFFER.current_line -= 1;
 
-                        for _ in 0..100_000 {}
+                        for _ in 0..10_000_000 {}
                     }
                 }
 

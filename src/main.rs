@@ -15,8 +15,15 @@ use core::{
 use acpi::{
     AcpiTables,
     AmlTable,
+    Handler,
+    PciAddress,
     aml::Interpreter,
-    platform::AcpiPlatform,
+    platform::{
+        AcpiPlatform,
+        PciConfigRegions,
+        pci,
+    },
+    sdt::mcfg::McfgEntry,
 };
 use embedded_graphics::{
     mono_font::{
@@ -33,6 +40,11 @@ use embedded_graphics::{
         WebColors,
     },
     text::Text,
+};
+use pci_types::{
+    ConfigRegionAccess,
+    PciHeader,
+    device_type::DeviceType,
 };
 use x86_64::{
     PhysAddr,
@@ -357,7 +369,8 @@ static mut ALLOCATOR: Locked<BumpAllocator> =
     Locked::new(BumpAllocator::new(VirtAddr::new(0x8000_0000)));
 
 struct AcpiHandlerImpl {
-    virt_start: VirtAddr,
+    virt_start:   VirtAddr,
+    pci_mappings: Option<PciConfigRegions>,
 }
 
 #[derive(Clone)]
@@ -383,6 +396,61 @@ impl AcpiHandler {
     ) {
         let mut port = x86_64::instructions::port::Port::new(port);
         unsafe { port.write(value) }
+    }
+
+    pub fn read_pci_generic<T: num_traits::PrimInt>(
+        &self,
+        address: acpi::PciAddress,
+        offset: u16,
+    ) -> Option<T> {
+        let inner = unsafe { &mut *self.inner.get() };
+        let mappings = inner.pci_mappings.as_ref()?;
+
+        let phys_addr = mappings.physical_address(
+            address.segment(),
+            address.bus(),
+            address.device(),
+            address.function(),
+        )?;
+
+        let Ok(physical_address) = usize::try_from(phys_addr + u64::from(offset)) else {
+            unreachable!()
+        };
+
+        let mapped_region = unsafe { self.map_physical_region(physical_address, size_of::<T>()) };
+        let value = unsafe { mapped_region.virtual_start.read() };
+        Self::unmap_physical_region(&mapped_region);
+
+        Some(value)
+    }
+
+    pub fn write_pci_generic<T: num_traits::PrimInt>(
+        &self,
+        address: acpi::PciAddress,
+        offset: u16,
+        value: T,
+    ) {
+        let inner = unsafe { &mut *self.inner.get() };
+        let Some(ref mappings) = inner.pci_mappings else {
+            return;
+        };
+
+        let Some(phys_addr) = mappings.physical_address(
+            address.segment(),
+            address.bus(),
+            address.device(),
+            address.function(),
+        ) else {
+            return;
+        };
+
+        let Ok(physical_address) = usize::try_from(phys_addr + u64::from(offset)) else {
+            unreachable!()
+        };
+
+        let mapped_region = unsafe { self.map_physical_region(physical_address, size_of::<T>()) };
+        unsafe { mapped_region.virtual_start.write(value) };
+        Self::unmap_physical_region(&mapped_region);
     }
 }
 
@@ -428,7 +496,7 @@ impl acpi::Handler for AcpiHandler {
             }
         }
 
-        let Ok(virtual_address) = usize::try_from(virt.as_u64()) else {
+        let Ok(virtual_address) = usize::try_from(virt.as_u64() + offset) else {
             unreachable!()
         };
 
@@ -446,8 +514,18 @@ impl acpi::Handler for AcpiHandler {
         }
     }
 
-    fn unmap_physical_region<T>(_region: &acpi::PhysicalMapping<Self, T>) {
-        // For now; don't worry bout it :3
+    fn unmap_physical_region<T>(region: &acpi::PhysicalMapping<Self, T>) {
+        let Ok(addr) = u64::try_from(region.virtual_start.addr().get()) else {
+            unreachable!()
+        };
+
+        unsafe {
+            if let Ok((_, flush)) =
+                PAGE_TABLE.unmap(Page::<Size4KiB>::containing_address(VirtAddr::new(addr)))
+            {
+                flush.flush();
+            }
+        }
     }
 
     fn read_u8(
@@ -455,9 +533,11 @@ impl acpi::Handler for AcpiHandler {
         address: usize,
     ) -> u8 {
         unsafe {
-            self.map_physical_region(address, size_of::<u8>())
-                .virtual_start
-                .read()
+            let mapping = self.map_physical_region(address, size_of::<u8>());
+            let value = mapping.virtual_start.read();
+            Self::unmap_physical_region(&mapping);
+
+            value
         }
     }
 
@@ -466,9 +546,11 @@ impl acpi::Handler for AcpiHandler {
         address: usize,
     ) -> u16 {
         unsafe {
-            self.map_physical_region(address, size_of::<u16>())
-                .virtual_start
-                .read()
+            let mapping = self.map_physical_region(address, size_of::<u16>());
+            let value = mapping.virtual_start.read();
+            Self::unmap_physical_region(&mapping);
+
+            value
         }
     }
 
@@ -477,9 +559,11 @@ impl acpi::Handler for AcpiHandler {
         address: usize,
     ) -> u32 {
         unsafe {
-            self.map_physical_region(address, size_of::<u32>())
-                .virtual_start
-                .read()
+            let mapping = self.map_physical_region(address, size_of::<u32>());
+            let value = mapping.virtual_start.read();
+            Self::unmap_physical_region(&mapping);
+
+            value
         }
     }
 
@@ -488,9 +572,11 @@ impl acpi::Handler for AcpiHandler {
         address: usize,
     ) -> u64 {
         unsafe {
-            self.map_physical_region(address, size_of::<u64>())
-                .virtual_start
-                .read()
+            let mapping = self.map_physical_region(address, size_of::<u64>());
+            let value = mapping.virtual_start.read();
+            Self::unmap_physical_region(&mapping);
+
+            value
         }
     }
 
@@ -500,9 +586,9 @@ impl acpi::Handler for AcpiHandler {
         value: u8,
     ) {
         unsafe {
-            self.map_physical_region(address, size_of::<u8>())
-                .virtual_start
-                .write(value);
+            let mapping = self.map_physical_region(address, size_of::<u8>());
+            mapping.virtual_start.write(value);
+            Self::unmap_physical_region(&mapping);
         }
     }
 
@@ -512,9 +598,9 @@ impl acpi::Handler for AcpiHandler {
         value: u16,
     ) {
         unsafe {
-            self.map_physical_region(address, size_of::<u16>())
-                .virtual_start
-                .write(value);
+            let mapping = self.map_physical_region(address, size_of::<u16>());
+            mapping.virtual_start.write(value);
+            Self::unmap_physical_region(&mapping);
         }
     }
 
@@ -524,9 +610,9 @@ impl acpi::Handler for AcpiHandler {
         value: u32,
     ) {
         unsafe {
-            self.map_physical_region(address, size_of::<u32>())
-                .virtual_start
-                .write(value);
+            let mapping = self.map_physical_region(address, size_of::<u32>());
+            mapping.virtual_start.write(value);
+            Self::unmap_physical_region(&mapping);
         }
     }
 
@@ -536,9 +622,9 @@ impl acpi::Handler for AcpiHandler {
         value: u64,
     ) {
         unsafe {
-            self.map_physical_region(address, size_of::<u64>())
-                .virtual_start
-                .write(value);
+            let mapping = self.map_physical_region(address, size_of::<u64>());
+            mapping.virtual_start.write(value);
+            Self::unmap_physical_region(&mapping);
         }
     }
 
@@ -592,7 +678,8 @@ impl acpi::Handler for AcpiHandler {
         address: acpi::PciAddress,
         offset: u16,
     ) -> u8 {
-        todo!()
+        self.read_pci_generic(address, offset)
+            .expect("Unable to read from PCI bus")
     }
 
     fn read_pci_u16(
@@ -600,7 +687,8 @@ impl acpi::Handler for AcpiHandler {
         address: acpi::PciAddress,
         offset: u16,
     ) -> u16 {
-        todo!()
+        self.read_pci_generic(address, offset)
+            .expect("Unable to read from PCI bus")
     }
 
     fn read_pci_u32(
@@ -608,7 +696,8 @@ impl acpi::Handler for AcpiHandler {
         address: acpi::PciAddress,
         offset: u16,
     ) -> u32 {
-        todo!()
+        self.read_pci_generic(address, offset)
+            .expect("Unable to read from PCI bus")
     }
 
     fn write_pci_u8(
@@ -617,7 +706,7 @@ impl acpi::Handler for AcpiHandler {
         offset: u16,
         value: u8,
     ) {
-        todo!()
+        self.write_pci_generic(address, offset, value);
     }
 
     fn write_pci_u16(
@@ -626,7 +715,7 @@ impl acpi::Handler for AcpiHandler {
         offset: u16,
         value: u16,
     ) {
-        todo!()
+        self.write_pci_generic(address, offset, value);
     }
 
     fn write_pci_u32(
@@ -635,7 +724,7 @@ impl acpi::Handler for AcpiHandler {
         offset: u16,
         value: u32,
     ) {
-        todo!()
+        self.write_pci_generic(address, offset, value);
     }
 
     fn nanos_since_boot(&self) -> u64 {
@@ -673,6 +762,47 @@ impl acpi::Handler for AcpiHandler {
         mutex: acpi::Handle,
     ) {
     }
+}
+
+impl ConfigRegionAccess for AcpiHandler {
+    unsafe fn read(
+        &self,
+        address: PciAddress,
+        offset: u16,
+    ) -> u32 {
+        let result = self.read_pci_generic(address, offset);
+        debug_assert!(result.is_some(), "Invalid PCI Address");
+        unsafe { result.unwrap_unchecked() }
+    }
+
+    unsafe fn write(
+        &self,
+        address: PciAddress,
+        offset: u16,
+        value: u32,
+    ) {
+        self.write_pci_generic(address, offset, value);
+    }
+}
+
+fn enumerate_pci_devices<H: acpi::Handler + ConfigRegionAccess>(
+    acpi_tables: &AcpiTables<H>,
+    handler: &H,
+) -> impl Iterator<Item = pci_types::PciHeader> {
+    let config_regions = PciConfigRegions::new(acpi_tables).expect("No PCI :(");
+    config_regions
+        .regions
+        .into_iter()
+        .flat_map(|entry| {
+            (entry.bus_number_start..=entry.bus_number_end).flat_map(move |bus| {
+                (0..32).map(move |device| PciAddress::new(entry.pci_segment_group, bus, device, 0))
+            })
+        })
+        .map(PciHeader::new)
+        .filter(move |header| {
+            let (vendor, _device) = header.id(handler);
+            vendor != 0xffff
+        })
 }
 
 #[unsafe(no_mangle)]
@@ -727,42 +857,30 @@ extern "C" fn _start() -> ! {
             addr_usize
         };
 
-        let handler = AcpiHandler::new(
-            (AcpiHandlerImpl {
-                virt_start: VirtAddr::new(0x6000_0000),
-            }),
-        );
+        let handler = AcpiHandler::new(AcpiHandlerImpl {
+            virt_start:   VirtAddr::new(0x6000_0000),
+            pci_mappings: None,
+        });
 
         let Ok(acpi_tables) = AcpiTables::from_rsdp(handler.clone(), rdsp_address) else {
             panic!("I really don't know what to do from here...");
         };
-        let platform = AcpiPlatform::new(acpi_tables, handler).expect("aw :(");
-        let interpreter = Interpreter::new_from_platform(&platform).expect("aw :((");
-        interpreter.initialize_namespace();
 
-        println!("{}", interpreter.namespace.lock());
-    }
+        // Initalize PCIe
+        let config_regions = PciConfigRegions::new(&acpi_tables).expect("No PCI :(");
+        {
+            let inner = &mut *handler.inner.get();
+            inner.pci_mappings = Some(config_regions);
+        }
 
-    /*
-    let framebuffer = unsafe { FRAMEBUFFER_INFO.response() };
-    if let Some(data) = framebuffer {
-        let buffers = data.as_slice();
-        if !buffers.is_empty() {
-            let buffer = unsafe { buffers[0].as_ref() };
-            let dest = buffer.address;
+        for header in enumerate_pci_devices(&acpi_tables, &handler) {
+            let (_revision, base_class, sub_class, _interface) =
+                header.revision_and_class(&handler);
 
-            // For now, assume RGBX32
-            for i in 0..100 {
-                unsafe {
-                    let Ok(index) = usize::try_from(i * (buffer.pitch / 4) + i) else {
-                        unreachable!("Limine only supports 64-bit")
-                    };
-                    dest.byte_add(index).write_bytes(0xff, 4);
-                }
-            }
+            let device_type: DeviceType = (base_class, sub_class).into();
+            println!("{device_type:?} at {}", header.address());
         }
     }
-    */
 
     #[allow(clippy::empty_loop)]
     loop {}
