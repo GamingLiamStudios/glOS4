@@ -7,10 +7,7 @@ use x86_64::{
     },
 };
 
-use crate::{
-    framebuffer::FRAMEBUFFER,
-    println,
-};
+use crate::println;
 
 static mut IDT: InterruptDescriptorTable = InterruptDescriptorTable::new();
 
@@ -32,10 +29,6 @@ extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
-    unsafe {
-        FRAMEBUFFER.buffer = None;
-    }
-
     let rbp: u64;
     unsafe {
         core::arch::asm!("mov {}, rbp", out(reg) rbp);
@@ -62,9 +55,6 @@ fn generic_handler(
     index: u8,
     error_code: Option<u64>,
 ) {
-    unsafe {
-        FRAMEBUFFER.buffer = None;
-    }
     panic!("Interrupt! {stack_frame:?} {index} {error_code:?}");
 }
 
@@ -115,5 +105,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         println!("{}", info.message());
     }
 
-    loop {}
+    loop {
+        x86_64::instructions::hlt();
+    }
 }

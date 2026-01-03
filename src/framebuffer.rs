@@ -1,29 +1,25 @@
 use alloc::boxed::Box;
-use core::fmt::Write;
-
-use embedded_graphics::{
-    Pixel,
-    mono_font::{
-        MonoTextStyle,
-        ascii::FONT_10X20,
-    },
-    pixelcolor::{
-        Rgb888,
-        raw::ToBytes,
-    },
-    prelude::{
-        DrawTarget,
-        Drawable,
-        OriginDimensions,
-        Point,
-        Size,
-        WebColors,
-    },
-    text::Text,
+use core::{
+    fmt,
+    mem::MaybeUninit,
+    range::Range,
 };
 
+use bitvec::boxed::BitBox;
+use num_traits::float::FloatCore;
+use swash::FontRef;
+
 use super::limine;
-use crate::limine::FramebufferDescriptor;
+use crate::{
+    ansi::{
+        self,
+        ControlSequence,
+        Direction,
+        EraseRegion,
+        SelectGraphicRendition,
+    },
+    limine::FramebufferDescriptor,
+};
 
 #[unsafe(link_section = ".limine_requests")]
 #[used]
@@ -42,196 +38,507 @@ fn framebuffer_info() -> &'static FramebufferDescriptor {
     unsafe { framebuffer.as_ref() }
 }
 
-pub struct UefiFramebuffer {
-    current_line: usize,
-    pub buffer:   Option<Box<[u8]>>,
+/// Describes memory layout of a single Pixel
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelLayout {
+    /// Red-Green-Blue
+    Rgb {
+        red_mask:   Range<u8>,
+        green_mask: Range<u8>,
+        blue_mask:  Range<u8>,
+    },
+    /// Y-Cb-Cr
+    Yuv {
+        luma_mask: Range<u8>,
+        blue_mask: Range<u8>,
+        red_mask:  Range<u8>,
+    },
 }
-pub static mut FRAMEBUFFER: UefiFramebuffer = UefiFramebuffer {
-    current_line: 0,
-    buffer:       None,
-};
+
+impl PixelLayout {
+    const fn from_descriptor(desc: &FramebufferDescriptor) -> Self {
+        Self::Rgb {
+            red_mask:   Range {
+                start: desc.red_mask_shift,
+                end:   desc.red_mask_shift + desc.red_mask_size,
+            },
+            green_mask: Range {
+                start: desc.green_mask_shift,
+                end:   desc.green_mask_shift + desc.green_mask_size,
+            },
+            blue_mask:  Range {
+                start: desc.blue_mask_shift,
+                end:   desc.blue_mask_shift + desc.blue_mask_size,
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Owned<'a> {
+    data: &'a [u8],
+
+    pitch:  usize,
+    width:  usize,
+    height: usize,
+
+    /// Layout of [`data`](Self::data)
+    pixel_layout:   PixelLayout,
+    bits_per_pixel: u16,
+}
+
+#[derive(Debug)]
+pub struct PixelBuffer<T: AsRef<[u8]>> {
+    data: T,
+
+    pitch:  usize,
+    width:  usize,
+    height: usize,
+
+    /// Layout of [`data`](Self::data)
+    pixel_layout:   PixelLayout,
+    bits_per_pixel: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Point2 {
+    x: usize,
+    y: usize,
+}
+
+fn u64_to_usize(value: u64) -> usize {
+    let Ok(value) = usize::try_from(value) else {
+        unreachable!()
+    };
+    value
+}
+
+pub struct UefiFramebuffer {
+    active_mode: usize,
+}
+pub static FRAMEBUFFER: spin::Mutex<UefiFramebuffer> =
+    spin::Mutex::new(UefiFramebuffer { active_mode: 0 });
 
 impl UefiFramebuffer {
-    pub fn init(&mut self) {
-        let framebuffer = framebuffer_info();
-
-        let Ok(length) = usize::try_from(framebuffer.pitch * framebuffer.height) else {
-            unreachable!()
+    #[allow(clippy::unused_self)]
+    pub fn available_modes(&self) -> impl Iterator<Item = &'static FramebufferDescriptor> {
+        let Some(framebuffer_info) = (unsafe { FRAMEBUFFER_INFO.response() }) else {
+            panic!("No framebuffers exist!");
         };
 
-        let buffer = Box::new_uninit_slice(length);
-        let mut buffer = unsafe { buffer.assume_init() };
-        buffer.fill(0x00);
-
-        self.buffer = Some(buffer);
+        framebuffer_info
+            .as_slice()
+            .iter()
+            .map(|ptr| unsafe { ptr.as_ref() })
     }
 
-    pub fn flush(&mut self) {
-        let Some(buffer) = self.buffer.as_mut() else {
-            return;
-        };
-
-        let framebuffer = framebuffer_info();
+    pub fn active_mode(&self) -> &'static FramebufferDescriptor {
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                buffer.as_ptr(),
-                framebuffer.address.as_ptr(),
-                buffer.len(),
-            );
+            let Some(framebuffer_info) = FRAMEBUFFER_INFO.response() else {
+                panic!("No framebuffers exist!");
+            };
+
+            framebuffer_info.as_slice()[self.active_mode].as_ref()
         }
     }
-}
 
-impl DrawTarget for UefiFramebuffer {
-    type Color = Rgb888;
-    type Error = ();
-
-    fn draw_iter<I>(
+    pub const fn set_active_mode(
         &mut self,
-        pixels: I,
-    ) -> Result<(), Self::Error>
-    where
-        I: IntoIterator<Item = embedded_graphics::Pixel<Self::Color>>,
-    {
-        let framebuffer = framebuffer_info();
-        if self.buffer.is_none() {
-            //self.init();
+        mode: usize,
+    ) {
+        self.active_mode = mode;
+    }
+
+    /// Safety:
+    /// - `buffer` does not point to target framebuffer
+    #[allow(clippy::needless_pass_by_ref_mut)] // Is absolutely a mutable operation but rust is dumb
+    pub fn blit_buffer<T: AsRef<[u8]>>(
+        &mut self,
+        buffer: &PixelBuffer<T>,
+        offset: &Point2,
+    ) {
+        let active_mode = self.active_mode();
+
+        if offset.x + buffer.width > u64_to_usize(active_mode.width) {
+            return;
+        }
+        if offset.y + buffer.height > u64_to_usize(active_mode.height) {
+            return;
         }
 
-        for Pixel(point, color) in pixels {
-            let Ok(pixel_x) = u64::try_from(point.x) else {
-                panic!("Unable to draw pixel! OOB");
-            };
-            let Ok(pixel_y) = u64::try_from(point.y) else {
-                panic!("Unable to draw pixel! OOB");
+        let dst_pitch = u64_to_usize(active_mode.pitch);
+        let dst_layout = PixelLayout::from_descriptor(active_mode);
+
+        if active_mode.bits_per_pixel == buffer.bits_per_pixel && dst_layout == buffer.pixel_layout
+        {
+            let Some(bytes_per_pixel) = active_mode.bits_per_pixel.div_exact(8) else {
+                todo!("UefiFramebuffer::blit_buffer doesn't support non-byte-aligned PixelLayouts");
             };
 
-            let offset = usize::try_from(
-                framebuffer.pitch * pixel_y + pixel_x * u64::from(framebuffer.bits_per_pixel / 8),
-            )
-            .expect("Pixel Offset too large!");
+            for src_y in 0..buffer.height {
+                let src_offs = src_y * dst_pitch;
+                let dst_offs =
+                    (offset.y + src_y) * dst_pitch + offset.x * usize::from(bytes_per_pixel);
+                let length = buffer.width * usize::from(bytes_per_pixel);
 
-            if let Some(buffer) = self.buffer.as_mut() {
-                buffer[offset..offset + color.to_ne_bytes().len()]
-                    .copy_from_slice(&color.to_ne_bytes());
-            } else {
                 unsafe {
-                    let addr = framebuffer.address.add(offset);
-                    core::ptr::copy_nonoverlapping(
-                        (&raw const color).cast(),
-                        addr.as_ptr(),
-                        size_of_val(&color),
-                    );
+                    let src_ptr = buffer.data.as_ref().as_ptr().add(src_offs);
+                    let dst_ptr = active_mode.address.add(dst_offs).as_ptr();
+
+                    core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, length);
                 }
             }
+
+            return;
         }
 
-        Ok(())
-    }
-}
-
-impl OriginDimensions for UefiFramebuffer {
-    fn size(&self) -> Size {
-        let framebuffer = framebuffer_info();
-
-        let width = u32::try_from(framebuffer.width).unwrap_or(u32::MAX);
-        let height = u32::try_from(framebuffer.height).unwrap_or(u32::MAX);
-        Size::new(width, height)
-    }
-}
-
-// Simple wrapper to write into a byte buffer
-struct BufferWriter<'a> {
-    buffer:   &'a mut [u8],
-    position: usize,
-}
-
-impl<'a> BufferWriter<'a> {
-    const fn new(buffer: &'a mut [u8]) -> Self {
-        Self {
-            buffer,
-            position: 0,
-        }
-    }
-
-    fn as_str(&self) -> &str {
-        core::str::from_utf8(&self.buffer[..self.position]).unwrap_or("")
-    }
-}
-
-impl core::fmt::Write for BufferWriter<'_> {
-    fn write_str(
-        &mut self,
-        s: &str,
-    ) -> core::fmt::Result {
-        let bytes = s.as_bytes();
-        let remaining = self.buffer.len() - self.position;
-
-        if bytes.len() > remaining {
-            return Err(core::fmt::Error);
-        }
-
-        self.buffer[self.position..self.position + bytes.len()].copy_from_slice(bytes);
-        self.position += bytes.len();
-        Ok(())
+        todo!("UefiFramebuffer::blit_buffer doesn't support non-native src buffers");
     }
 }
 
 #[macro_export]
-macro_rules! println {
-    ($($arg:tt)*) => ($crate::framebuffer::println(format_args!($($arg)*)));
+macro_rules! print {
+    ($($args:tt)*) => {$crate::framebuffer::print(format_args!($($args)*))};
 }
 
-// TODO: Improve
-pub fn println(args: core::fmt::Arguments) {
-    let mut buffer = [0u8; 2048];
-    let mut writer = BufferWriter::new(&mut buffer);
-    _ = writer.write_fmt(args);
+#[macro_export]
+macro_rules! println {
+    () => {
+        $crate::print!("\r\n");
+    };
+    ($($args:tt)*) => {
+        $crate::print!("{}\r\n", format_args!($($args)*));
+    };
+}
 
-    let max_chars = ((unsafe { FRAMEBUFFER.size().width } / 10) - 3) as usize;
+#[allow(clippy::cast_precision_loss)]
+const fn lossy_usize_to_f32(value: usize) -> f32 {
+    value as f32
+}
 
-    for line in writer.as_str().lines() {
-        for start in (0..line.len()).step_by(max_chars) {
-            let end = core::cmp::min(start + max_chars, line.len());
-            let sub_str = &line[start..end];
+/// Returns `f32::floor` as an integer
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn downcast_f32_to_usize(value: f32) -> usize {
+    value.floor() as usize
+}
 
-            unsafe {
-                let mut text_y = 20 + FRAMEBUFFER.current_line * 23;
-                if text_y + 20 >= FRAMEBUFFER.size().height as usize {
-                    text_y -= 23;
+// ASCII escape codes only support 24-bit color
+type Color = rgb::RGB<u8>;
 
-                    if FRAMEBUFFER.buffer.is_none() {
-                        FRAMEBUFFER.init();
-                    }
+#[derive(Debug, Clone, Copy)]
+struct CharCell {
+    char: char,
 
-                    if let Some(buffer) = FRAMEBUFFER.buffer.as_mut() {
-                        let buffer_info = framebuffer_info();
-                        let Ok(pitch) = usize::try_from(buffer_info.pitch) else {
-                            unreachable!()
-                        };
-                        let clipped_start = pitch * 23;
-                        buffer.copy_within(clipped_start..buffer.len(), 0);
+    foreground: Color,
+    background: Color,
+}
 
-                        let len = buffer.len();
-                        buffer[len - clipped_start..].fill(0x00);
-                        FRAMEBUFFER.current_line -= 1;
-
-                        for _ in 0..10_000_000 {}
-                    }
-                }
-
-                if let Ok(text_y) = i32::try_from(text_y) {
-                    _ = Text::new(
-                        sub_str,
-                        Point::new(20, text_y),
-                        MonoTextStyle::new(&FONT_10X20, Rgb888::CSS_WHITE),
-                    )
-                    .draw(&mut FRAMEBUFFER);
-
-                    FRAMEBUFFER.current_line += 1;
-                    FRAMEBUFFER.flush();
-                }
-            }
+impl Default for CharCell {
+    fn default() -> Self {
+        Self {
+            char:       ' ',
+            foreground: Color::new(255, 255, 255),
+            background: Color::new(0, 0, 0),
         }
     }
+}
+
+struct KernelLog {
+    cells: Box<[CharCell]>,
+    dirty: BitBox,
+
+    size:   (usize, usize),
+    cursor: (usize, usize),
+
+    framebuffer:   PixelBuffer<Box<[u8]>>,
+    should_render: bool,
+}
+
+impl KernelLog {
+    pub fn new<T: AsRef<[u8]>>(
+        target: &PixelBuffer<T>,
+        ppem: f32,
+    ) -> Self {
+        // Compute glyph width/height
+        let font = FontRef::from_index(JETBRAINS_MONO, 0)
+            .expect("Console font doesn't have anything at index 0");
+        let space_gid = font.charmap().map(' ');
+        let m_gid = font.charmap().map('M');
+
+        let metrics = font.glyph_metrics(&[]).scale(ppem);
+        assert!(
+            (metrics.advance_width(m_gid) - metrics.advance_width(space_gid)).abs() <= 0.01,
+            "Provided terminal font is not Monospace!"
+        );
+
+        let num_cells_width = downcast_f32_to_usize(
+            lossy_usize_to_f32(target.width) / metrics.advance_width(space_gid),
+        );
+        let num_cells_height = downcast_f32_to_usize(
+            lossy_usize_to_f32(target.height) / metrics.advance_height(space_gid),
+        );
+
+        let dirty = BitBox::from_boxed_slice(unsafe {
+            Box::new_zeroed_slice(num_cells_width * num_cells_height).assume_init()
+        });
+
+        Self {
+            cells: unsafe {
+                let mut cells = Box::new_zeroed_slice(num_cells_width * num_cells_height);
+                cells.fill(MaybeUninit::new(CharCell::default()));
+                cells.assume_init()
+            },
+            dirty,
+            cursor: (0, 0),
+            size: (num_cells_width, num_cells_height),
+            framebuffer: PixelBuffer {
+                data: unsafe {
+                    Box::new_zeroed_slice(target.width * target.height * size_of::<Color>())
+                        .assume_init()
+                },
+
+                width:  target.width,
+                height: target.height,
+                pitch:  target.width * size_of::<Color>(),
+
+                pixel_layout:   PixelLayout::Rgb {
+                    red_mask:   (0..8).into(),
+                    green_mask: (8..16).into(),
+                    blue_mask:  (16..24).into(),
+                },
+                bits_per_pixel: 24,
+            },
+            should_render: false,
+        }
+    }
+
+    fn wipe_region(
+        &mut self,
+        start: (usize, usize),
+        end: (usize, usize),
+    ) {
+        todo!("Implement Region Wipe")
+    }
+
+    fn scroll_up(
+        &mut self,
+        amount: isize,
+    ) {
+        let (width, height) = self.size;
+
+        if amount > 0 {
+            let amount = amount.cast_unsigned();
+            self.cells
+                .copy_within((width * amount)..(width * (height - amount)), 0);
+            self.cells[(width * (height - 1))..].fill(CharCell::default());
+        } else {
+            let amount = amount.abs().cast_unsigned();
+            self.cells
+                .copy_within(0..(width * (height - amount)), width * amount);
+            self.cells[0..(width * amount)].fill(CharCell::default());
+        }
+
+        self.dirty.fill(true);
+    }
+
+    fn set_cursor_mode(
+        &mut self,
+        mode: &SelectGraphicRendition,
+    ) {
+        let (cursor_x, cursor_y) = self.cursor;
+        let (width, _height) = self.size;
+        let Some(cell) = self.cells.get_mut(cursor_y * width + cursor_x) else {
+            return;
+        };
+
+        match mode {
+            SelectGraphicRendition::Background(color) => {
+                cell.background = color.as_rgb();
+            },
+            SelectGraphicRendition::Foreground(color) => {
+                cell.foreground = color.as_rgb();
+            },
+            _ => {}, // Not Yet Implemented
+        }
+
+        self.dirty.set(cursor_y * width + cursor_x, true);
+    }
+
+    fn flush_framebuffer(&mut self) {
+        // TODO: Render dirty cells
+
+        self.should_render = false;
+        self.dirty.fill(false);
+    }
+}
+
+const JETBRAINS_MONO: &[u8] =
+    include_bytes!("../resources/JetBrains_Mono/JetBrainsMono-VariableFont_wght.ttf");
+
+static KERNEL_LOG: spin::Mutex<Option<KernelLog>> = spin::Mutex::new(None);
+
+const TAB_WIDTH: usize = 4;
+
+#[allow(clippy::too_many_lines)] // FIXME
+pub fn print(args: fmt::Arguments<'_>) {
+    let mut kernel_log = KERNEL_LOG.lock();
+    let kernel_log = kernel_log.get_or_insert_with(|| {
+        let framebuffer_info = framebuffer_info();
+
+        KernelLog::new(
+            &PixelBuffer {
+                data:           &[],
+                pitch:          u64_to_usize(framebuffer_info.pitch),
+                width:          u64_to_usize(framebuffer_info.width),
+                height:         u64_to_usize(framebuffer_info.height),
+                pixel_layout:   PixelLayout::from_descriptor(framebuffer_info),
+                bits_per_pixel: framebuffer_info.bits_per_pixel,
+            },
+            12.0,
+        )
+    });
+
+    let formatted = alloc::fmt::format(args);
+    let (width, height) = kernel_log.size;
+
+    let mut chars = formatted.char_indices();
+    while let Some((index, char)) = chars.next() {
+        match char {
+            '\x07' => unimplemented!("Bell"), // Bell
+            '\x0C' => {},                     // Form Feed
+            '\x08' => {
+                let (x, y) = kernel_log.cursor;
+                kernel_log.cursor = (core::cmp::min(0, x - 1), y);
+            }, // Backspace
+            '\t' => {
+                let (x, y) = kernel_log.cursor;
+                kernel_log.cursor = (core::cmp::min(x.next_multiple_of(TAB_WIDTH), width), y);
+            }, // Tab
+            '\n' => {
+                // Takes the most literal approach and only increments y (for now)
+                let (x, y) = kernel_log.cursor;
+                kernel_log.cursor = (x, core::cmp::max(y + 1, height));
+            }, // Line Feed
+            '\r' => {
+                let (_, y) = kernel_log.cursor;
+                kernel_log.cursor = (0, y);
+            }, // Carriage Return
+            '\x1B' => {
+                use core::cmp::min;
+
+                let seq_start = &formatted[index..];
+                let Ok((remain, seq)) = ansi::parse_control_sequence(seq_start) else {
+                    continue;
+                };
+                _ = chars.advance_by(seq_start.len() - remain.len());
+
+                match seq {
+                    ControlSequence::DeviceStatus => unimplemented!("stdin doesn't exist"),
+                    ControlSequence::CursorMoveDir { dir, amt } => {
+                        let (x, y) = kernel_log.cursor;
+                        match dir {
+                            Direction::Up => kernel_log.cursor = (x, y.saturating_sub(1)),
+                            Direction::Down => kernel_log.cursor = (x, min(y + 1, height)),
+
+                            Direction::Forward => kernel_log.cursor = (min(x + 1, width), y),
+                            Direction::Back => kernel_log.cursor = (x.saturating_sub(1), y),
+                        }
+                    },
+                    ControlSequence::CursorMoveLine { dir, amt } => {
+                        let (x, y) = kernel_log.cursor;
+                        match dir {
+                            Direction::Forward | Direction::Back => unreachable!(),
+                            Direction::Down => kernel_log.cursor = (0, min(y + 1, height)),
+                            Direction::Up => kernel_log.cursor = (0, y.saturating_sub(1)),
+                        }
+                    },
+                    ControlSequence::CursorSet { x, y } => {
+                        let (_old_x, old_y) = kernel_log.cursor;
+                        kernel_log.cursor = (x, y.unwrap_or(old_y));
+                    },
+                    ControlSequence::EraseDisplay(region) => {
+                        let start;
+                        let end;
+
+                        let (x, y) = kernel_log.cursor;
+                        match region {
+                            EraseRegion::CursorToEnd => {
+                                start = kernel_log.cursor;
+                                end = kernel_log.size;
+                            },
+                            EraseRegion::StartToCursor => {
+                                start = (0, 0);
+                                end = kernel_log.cursor;
+                            },
+                            EraseRegion::StartToEnd => {
+                                start = (0, 0);
+                                end = kernel_log.size;
+                            },
+                            EraseRegion::PrevToEnd => {
+                                start = (0, 0);
+                                end = kernel_log.size;
+
+                                // TODO: Wipe Scrollback
+                            },
+                        }
+
+                        kernel_log.wipe_region(start, end);
+                    },
+                    ControlSequence::EraseLine(region) => {
+                        let start;
+                        let end;
+
+                        let (x, y) = kernel_log.cursor;
+                        match region {
+                            EraseRegion::CursorToEnd => {
+                                start = kernel_log.cursor;
+                                end = (width, y);
+                            },
+                            EraseRegion::StartToCursor => {
+                                start = (0, y);
+                                end = (x, y);
+                            },
+                            EraseRegion::StartToEnd => {
+                                start = (0, y);
+                                end = (width, y);
+                            },
+                            EraseRegion::PrevToEnd => unreachable!(),
+                        }
+
+                        kernel_log.wipe_region(start, end);
+                    },
+                    ControlSequence::Scroll { dir, amt } => {
+                        let amount =
+                            isize::try_from(amt).expect("Scroll amount is larger than isize::MAX");
+                        let sign = match dir {
+                            Direction::Up => 1,
+                            Direction::Down => -1,
+                            _ => unreachable!(),
+                        };
+                        kernel_log.scroll_up(amount * sign);
+                    },
+                    ControlSequence::Sgi(mode) => kernel_log.set_cursor_mode(&mode),
+                }
+            }, // ESC - Begin Sequence
+
+            char => {
+                let (cursor_x, cursor_y) = kernel_log.cursor;
+                let cell_index = cursor_y * width + cursor_x;
+
+                let cell = &mut kernel_log.cells[cell_index];
+                cell.char = char;
+
+                let new_cell = CharCell { char: ' ', ..*cell };
+                if let Some(next_cell) = kernel_log.cells.get_mut(cell_index + 1) {
+                    *next_cell = new_cell;
+                }
+
+                kernel_log.dirty.set(cell_index, true);
+                kernel_log.cursor = (core::cmp::min(width, cursor_x + 1), cursor_y);
+            },
+        }
+    }
+
+    kernel_log.should_render = true;
+    kernel_log.flush_framebuffer();
 }

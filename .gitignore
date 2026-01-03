@@ -8,3 +8,6 @@ target
 iso_root
 *.iso
 *.fd
+
+# Just until I can actually get it working :p
+resources/JetBrains_Mono

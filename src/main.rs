@@ -1,4 +1,10 @@
-#![feature(alloc_layout_extra, abi_x86_interrupt)]
+#![feature(
+    alloc_layout_extra,
+    abi_x86_interrupt,
+    new_range_api,
+    exact_div,
+    iter_advance_by
+)]
 #![allow(static_mut_refs)]
 #![no_std]
 #![no_main]
@@ -53,6 +59,7 @@ use crate::{
     limine::MemoryMapEntryType,
 };
 
+mod ansi;
 mod framebuffer;
 mod interrupts;
 mod limine;
@@ -784,13 +791,39 @@ fn enumerate_pci_devices<H: acpi::Handler + ConfigRegionAccess>(
         })
 }
 
+unsafe fn enable_fpu() {
+    use x86_64::registers::control::{
+        Cr0,
+        Cr0Flags,
+        Cr4,
+        Cr4Flags,
+    };
+
+    unsafe {
+        // Enable x87
+        Cr0::update(|cr0| {
+            cr0.set(Cr0Flags::EMULATE_COPROCESSOR, false);
+            //cr0.set(Cr0Flags::NUMERIC_ERROR, true);
+            cr0.set(Cr0Flags::MONITOR_COPROCESSOR, true);
+        });
+
+        Cr4::update(|cr4| {
+            cr4.set(Cr4Flags::OSFXSR, true);
+            cr4.set(Cr4Flags::OSXMMEXCPT_ENABLE, true);
+
+            // TODO: Enable XSAVE
+            // TODO: Enable AVX
+        });
+    }
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn _start() -> ! {
     unsafe {
+        enable_fpu();
+
         PAGE_TABLE = StaticPageTable::Offset(hddm_page_table());
         interrupts::initalize_idt();
-
-        FRAMEBUFFER.init();
     }
 
     assert!(
