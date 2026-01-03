@@ -7,7 +7,21 @@ use core::{
 
 use bitvec::boxed::BitBox;
 use num_traits::float::FloatCore;
-use swash::FontRef;
+use rgb::{
+    ColorComponentMap,
+    ComponentMap,
+    Rgb,
+    Rgba,
+};
+use swash::{
+    FontRef,
+    scale::{
+        Render,
+        ScaleContext,
+        Source,
+        image::Content,
+    },
+};
 
 use super::limine;
 use crate::{
@@ -169,8 +183,7 @@ impl UefiFramebuffer {
         let dst_pitch = u64_to_usize(active_mode.pitch);
         let dst_layout = PixelLayout::from_descriptor(active_mode);
 
-        if active_mode.bits_per_pixel == buffer.bits_per_pixel && dst_layout == buffer.pixel_layout
-        {
+        if active_mode.bits_per_pixel == buffer.bits_per_pixel {
             let Some(bytes_per_pixel) = active_mode.bits_per_pixel.div_exact(8) else {
                 todo!("UefiFramebuffer::blit_buffer doesn't support non-byte-aligned PixelLayouts");
             };
@@ -188,11 +201,7 @@ impl UefiFramebuffer {
                     core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, length);
                 }
             }
-
-            return;
         }
-
-        todo!("UefiFramebuffer::blit_buffer doesn't support non-native src buffers");
     }
 }
 
@@ -251,7 +260,70 @@ struct KernelLog {
     cursor: (usize, usize),
 
     framebuffer:   PixelBuffer<Box<[u8]>>,
+    ppem:          f32,
     should_render: bool,
+}
+
+pub const fn alpha_blend_channel(
+    src: u8,
+    dst: u8,
+    alpha: u8,
+) -> u8 {
+    let src = src as u16;
+    let dst = dst as u16;
+    let alpha = alpha as u16;
+
+    let out = (src * alpha + dst * (255 - alpha)) / 255;
+    out as u8
+}
+
+#[inline]
+pub const fn blend_rgb8(
+    src: Rgb<u8>,
+    dst: Rgb<u8>,
+    alpha: u8,
+) -> Rgb<u8> {
+    let a = alpha as u16;
+    let inv_a = 255 - a;
+
+    Rgb {
+        r: ((src.r as u16 * a + dst.r as u16 * inv_a) / 255) as u8,
+        g: ((src.g as u16 * a + dst.g as u16 * inv_a) / 255) as u8,
+        b: ((src.b as u16 * a + dst.b as u16 * inv_a) / 255) as u8,
+    }
+}
+
+#[inline]
+pub const fn blend_rgba(
+    src: Rgba<u8>,
+    dst: Rgba<u8>,
+) -> Rgba<u8> {
+    let sa = src.a as u16;
+    let da = dst.a as u16;
+
+    let out_a = sa + (da * (255 - sa) + 127) / 255;
+
+    if out_a == 0 {
+        return Rgba {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        };
+    }
+
+    let r = (src.r as u16 * sa + dst.r as u16 * da * (255 - sa) / 255) / out_a;
+
+    let g = (src.g as u16 * sa + dst.g as u16 * da * (255 - sa) / 255) / out_a;
+
+    let b = (src.b as u16 * sa + dst.b as u16 * da * (255 - sa) / 255) / out_a;
+
+    Rgba {
+        r: r as u8,
+        g: g as u8,
+        b: b as u8,
+        a: out_a as u8,
+    }
 }
 
 impl KernelLog {
@@ -291,22 +363,22 @@ impl KernelLog {
             dirty,
             cursor: (0, 0),
             size: (num_cells_width, num_cells_height),
+            ppem,
             framebuffer: PixelBuffer {
                 data: unsafe {
-                    Box::new_zeroed_slice(target.width * target.height * size_of::<Color>())
-                        .assume_init()
+                    Box::new_zeroed_slice(target.width * target.height * 4).assume_init()
                 },
 
                 width:  target.width,
                 height: target.height,
-                pitch:  target.width * size_of::<Color>(),
+                pitch:  target.width * 4,
 
                 pixel_layout:   PixelLayout::Rgb {
                     red_mask:   (0..8).into(),
                     green_mask: (8..16).into(),
                     blue_mask:  (16..24).into(),
                 },
-                bits_per_pixel: 24,
+                bits_per_pixel: 32,
             },
             should_render: false,
         }
@@ -365,10 +437,94 @@ impl KernelLog {
     }
 
     fn flush_framebuffer(&mut self) {
-        // TODO: Render dirty cells
+        let (width, height) = self.size;
+        let framebuffer: &mut [Rgba<u8>] = bytemuck::cast_slice_mut(&mut self.framebuffer.data);
+
+        for cell_index in self.dirty.iter_ones() {
+            let Some(cell) = self.cells.get_mut(cell_index) else {
+                continue;
+            };
+
+            let cell_y = cell_index.div_floor(width);
+            let cell_x = cell_index.rem_euclid(width);
+
+            let font = FontRef::from_index(JETBRAINS_MONO, 0)
+                .expect("No font at index 0 in JETBRAINS_MONO");
+            let glyph_id = font.charmap().map(cell.char);
+
+            let mut context = ScaleContext::new();
+            let mut scaler = context.builder(font).hint(true).size(self.ppem).build();
+            let image = Render::new(&[
+                Source::ColorOutline(0),
+                Source::ColorBitmap(swash::scale::StrikeWith::BestFit),
+                Source::Outline,
+            ])
+            .format(swash::zeno::Format::Alpha)
+            .render(&mut scaler, glyph_id)
+            .expect("Failed to render glyph");
+
+            let origin = font.metrics(&[]).scale(self.ppem).ascent as isize;
+
+            let cell_width = self.framebuffer.width / width;
+            let cell_height = self.framebuffer.height / height;
+
+            let Ok(glyph_left) = isize::try_from(image.placement.left) else {
+                unreachable!()
+            };
+
+            let Ok(glyph_top) = isize::try_from(image.placement.top) else {
+                unreachable!()
+            };
+
+            let glyph_x = (cell_width * cell_x).saturating_add_signed(glyph_left);
+            let glyph_y = (cell_height * cell_y).saturating_sub_signed(glyph_top - origin);
+
+            match image.content {
+                Content::SubpixelMask => unimplemented!(),
+                Content::Color => {
+                    let glyph_width = image.placement.width as usize;
+                    let row_size = glyph_width * 4;
+                    for (pixel_y, row) in image.data.chunks_exact(row_size).enumerate() {
+                        for (pixel_x, pixel) in row.chunks_exact(4).enumerate() {
+                            let x = glyph_x + pixel_x;
+                            let y = glyph_y + pixel_y;
+                            let color: &Rgba<u8> = bytemuck::from_bytes(pixel);
+
+                            let pixel = &mut framebuffer[y * self.framebuffer.width + x];
+                            *pixel = blend_rgba(*color, *pixel);
+                        }
+                    }
+                },
+                Content::Mask => {
+                    let glyph_width = image.placement.width as usize;
+                    let glyph_height = image.placement.height as usize;
+
+                    let mut i = 0;
+                    let bc = cell.foreground;
+                    for pixel_y in 0..glyph_height {
+                        for pixel_x in 0..glyph_width {
+                            let x = glyph_x + pixel_x;
+                            let y = glyph_y + pixel_y;
+
+                            let alpha = image.data[i];
+                            let color = bc.with_alpha(alpha);
+
+                            let pixel = &mut framebuffer[y * self.framebuffer.width + x];
+                            *pixel = blend_rgba(color, *pixel);
+                            i += 1;
+                        }
+                    }
+                },
+            }
+        }
 
         self.should_render = false;
         self.dirty.fill(false);
+
+        let Some(mut framebuffer) = FRAMEBUFFER.try_lock() else {
+            return;
+        };
+        framebuffer.blit_buffer(&self.framebuffer, &Point2 { x: 0, y: 0 });
     }
 }
 
@@ -394,7 +550,7 @@ pub fn print(args: fmt::Arguments<'_>) {
                 pixel_layout:   PixelLayout::from_descriptor(framebuffer_info),
                 bits_per_pixel: framebuffer_info.bits_per_pixel,
             },
-            12.0,
+            16.0,
         )
     });
 
@@ -460,7 +616,6 @@ pub fn print(args: fmt::Arguments<'_>) {
                         let start;
                         let end;
 
-                        let (x, y) = kernel_log.cursor;
                         match region {
                             EraseRegion::CursorToEnd => {
                                 start = kernel_log.cursor;

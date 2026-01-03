@@ -3,7 +3,8 @@
     abi_x86_interrupt,
     new_range_api,
     exact_div,
-    iter_advance_by
+    iter_advance_by,
+    int_roundings
 )]
 #![allow(static_mut_refs)]
 #![no_std]
@@ -54,10 +55,7 @@ use x86_64::{
     },
 };
 
-use crate::{
-    framebuffer::FRAMEBUFFER,
-    limine::MemoryMapEntryType,
-};
+use crate::limine::MemoryMapEntryType;
 
 mod ansi;
 mod framebuffer;
