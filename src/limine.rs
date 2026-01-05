@@ -5,12 +5,6 @@ use core::{
     ptr::NonNull,
 };
 
-use volatile::{
-    VolatilePtr,
-    VolatileRef,
-    access::ReadOnly,
-};
-
 #[unsafe(link_section = ".limine_requests_start")]
 #[used]
 static REQUESTS_START: [u64; 4] = [
@@ -136,14 +130,14 @@ impl FramebufferResponse {
 }
 
 #[repr(u8)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum FramebufferMemoryModel {
     Rgb = 1,
 }
 
 // TODO: Document
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct FramebufferDescriptor {
     pub address: NonNull<u8>,
 

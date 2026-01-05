@@ -924,6 +924,6 @@ extern "C" fn _start() -> ! {
     }
 
     loop {
-        println!("bitch");
+        x86_64::instructions::hlt();
     }
 }

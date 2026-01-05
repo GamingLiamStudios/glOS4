@@ -235,7 +235,7 @@ impl Default for CharCell {
     }
 }
 
-pub struct KernelLog {
+struct KernelLog {
     cells: Box<[CharCell]>,
     dirty: BitBox,
 
@@ -473,6 +473,7 @@ impl KernelLog {
 
             let glyph_id = font.charmap().map(cell.char);
 
+            // TODO: Glyph Cache
             let image = render
                 .render(&mut scaler, glyph_id)
                 .expect("Failed to render glyph");
@@ -547,7 +548,7 @@ impl KernelLog {
 const JETBRAINS_MONO: &[u8] =
     include_bytes!("../resources/JetBrains_Mono/JetBrainsMono-VariableFont_wght.ttf");
 
-pub static KERNEL_LOG: spin::Mutex<Option<KernelLog>> = spin::Mutex::new(None);
+static KERNEL_LOG: spin::Mutex<Option<KernelLog>> = spin::Mutex::new(None);
 
 const TAB_WIDTH: usize = 4;
 
