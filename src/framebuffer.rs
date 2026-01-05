@@ -235,7 +235,7 @@ impl Default for CharCell {
     }
 }
 
-struct KernelLog {
+pub struct KernelLog {
     cells: Box<[CharCell]>,
     dirty: BitBox,
 
@@ -376,7 +376,7 @@ impl KernelLog {
         }
     }
 
-    fn scroll_up(
+    pub fn scroll_up(
         &mut self,
         amount: isize,
     ) {
@@ -431,6 +431,18 @@ impl KernelLog {
         let (width, height) = self.size;
         let framebuffer: &mut [Rgba<u8>] = bytemuck::cast_slice_mut(&mut self.framebuffer.data);
 
+        let font =
+            FontRef::from_index(JETBRAINS_MONO, 0).expect("No font at index 0 in JETBRAINS_MONO");
+        let mut context = ScaleContext::new();
+        let mut scaler = context.builder(font).hint(true).size(self.ppem).build();
+
+        let mut render = Render::new(&[
+            Source::ColorOutline(0),
+            Source::ColorBitmap(swash::scale::StrikeWith::BestFit),
+            Source::Outline,
+        ]);
+        render.format(swash::zeno::Format::Alpha);
+
         for cell_index in self.dirty.iter_ones() {
             let Some(cell) = self.cells.get_mut(cell_index) else {
                 continue;
@@ -439,27 +451,35 @@ impl KernelLog {
             let cell_y = cell_index.div_floor(width);
             let cell_x = cell_index.rem_euclid(width);
 
-            let font = FontRef::from_index(JETBRAINS_MONO, 0)
-                .expect("No font at index 0 in JETBRAINS_MONO");
+            let cell_width = self.framebuffer.width / width;
+            let cell_height = self.framebuffer.height / height;
+
+            // Fill cell with background color
+            let background_color = premul_rgba(cell.background.with_alpha(u8::MAX));
+
+            for pixel_y in 0..cell_height {
+                for pixel_x in 0..cell_width {
+                    let x = (cell_width * cell_x) + pixel_x;
+                    let y = (cell_height * cell_y) + pixel_y;
+
+                    let pixel = &mut framebuffer[y * self.framebuffer.width + x];
+                    *pixel = background_color;
+                }
+            }
+
+            if cell.char == ' ' {
+                continue;
+            }
+
             let glyph_id = font.charmap().map(cell.char);
 
-            let mut context = ScaleContext::new();
-            let mut scaler = context.builder(font).hint(true).size(self.ppem).build();
-            let image = Render::new(&[
-                Source::ColorOutline(0),
-                Source::ColorBitmap(swash::scale::StrikeWith::BestFit),
-                Source::Outline,
-            ])
-            .format(swash::zeno::Format::Alpha)
-            .render(&mut scaler, glyph_id)
-            .expect("Failed to render glyph");
+            let image = render
+                .render(&mut scaler, glyph_id)
+                .expect("Failed to render glyph");
 
             // TODO: Ensure this is properly handled
             #[allow(clippy::cast_possible_truncation)]
             let origin = font.metrics(&[]).scale(self.ppem).ascent as isize;
-
-            let cell_width = self.framebuffer.width / width;
-            let cell_height = self.framebuffer.height / height;
 
             let Ok(glyph_left) = isize::try_from(image.placement.left) else {
                 unreachable!()
@@ -472,7 +492,6 @@ impl KernelLog {
             let glyph_x = (cell_width * cell_x).saturating_add_signed(glyph_left);
             let glyph_y = (cell_height * cell_y).saturating_sub_signed(glyph_top - origin);
 
-            let background_color = premul_rgba(cell.background.with_alpha(u8::MAX));
             match image.content {
                 Content::SubpixelMask => unimplemented!("Swash returned unexpected SubpixelMask"),
                 Content::Color => {
@@ -528,7 +547,7 @@ impl KernelLog {
 const JETBRAINS_MONO: &[u8] =
     include_bytes!("../resources/JetBrains_Mono/JetBrainsMono-VariableFont_wght.ttf");
 
-static KERNEL_LOG: spin::Mutex<Option<KernelLog>> = spin::Mutex::new(None);
+pub static KERNEL_LOG: spin::Mutex<Option<KernelLog>> = spin::Mutex::new(None);
 
 const TAB_WIDTH: usize = 4;
 
@@ -565,11 +584,15 @@ pub fn print(args: fmt::Arguments<'_>) {
             }, // Backspace
             '\t' => {
                 let (x, y) = kernel_log.cursor;
-                kernel_log.cursor = (core::cmp::min(x.next_multiple_of(TAB_WIDTH), width), y);
+                kernel_log.cursor = (core::cmp::min(x.next_multiple_of(TAB_WIDTH), width - 1), y);
             }, // Tab
             '\n' => {
                 let (_x, y) = kernel_log.cursor;
-                kernel_log.cursor = (0, core::cmp::min(y + 1, height));
+                if y + 1 >= height {
+                    // Scroll console
+                    kernel_log.scroll_up(1);
+                }
+                kernel_log.cursor = (0, core::cmp::min(y + 1, height - 1));
             }, // Line Feed
             '\r' => {
                 let (_, y) = kernel_log.cursor;
@@ -676,7 +699,9 @@ pub fn print(args: fmt::Arguments<'_>) {
                 let (cursor_x, cursor_y) = kernel_log.cursor;
                 let cell_index = cursor_y * width + cursor_x;
 
-                let cell = &mut kernel_log.cells[cell_index];
+                let Some(cell) = kernel_log.cells.get_mut(cell_index) else {
+                    continue;
+                };
                 cell.char = char;
 
                 let new_cell = CharCell { char: ' ', ..*cell };

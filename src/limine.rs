@@ -1,7 +1,14 @@
+use alloc::fmt::Debug;
 use core::{
     ffi::c_void,
     ops::Deref,
     ptr::NonNull,
+};
+
+use volatile::{
+    VolatilePtr,
+    VolatileRef,
+    access::ReadOnly,
 };
 
 #[unsafe(link_section = ".limine_requests_start")]
@@ -18,6 +25,7 @@ static REQUESTS_START: [u64; 4] = [
 static REQUESTS_END: [u64; 2] = [0xadc0_e053_1bb1_0d03, 0x9572_709f_3176_4c62];
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct BaseRevision {
     magic: [u64; 2],
     ver:   u64,
@@ -31,19 +39,22 @@ impl BaseRevision {
         }
     }
 
-    #[allow(clippy::missing_const_for_fn)]
     pub fn is_supported(&self) -> bool {
-        self.ver == 0
+        unsafe {
+            let ver = core::ptr::read_volatile(&raw const self.ver);
+            ver == 0
+        }
     }
 }
 
 #[repr(C)]
-pub struct FullResponse<T> {
+#[derive(Debug, Clone, Copy)]
+pub struct FullResponse<T: Debug + Clone + Copy> {
     pub revision: u64,
     data:         T,
 }
 
-impl<T> Deref for FullResponse<T> {
+impl<T: Debug + Clone + Copy> Deref for FullResponse<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -55,7 +66,7 @@ pub trait ImplRequest {
     const ID: [u64; 2];
     const REVISION: u64;
 
-    type Response;
+    type Response: Debug + Clone + Copy;
 }
 
 #[repr(C)]
@@ -82,8 +93,11 @@ impl<T: ImplRequest> Request<T> {
         }
     }
 
-    pub const unsafe fn response(&self) -> Option<&FullResponse<T::Response>> {
-        unsafe { self.response.as_ref() }
+    pub unsafe fn response(&self) -> Option<&FullResponse<T::Response>> {
+        unsafe {
+            let self_ = core::ptr::read_volatile(self);
+            self_.response.as_ref()
+        }
     }
 }
 
@@ -106,13 +120,14 @@ impl ImplRequest for BootloaderInfo {
 */
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct FramebufferResponse {
     num_buffers: u64,
     buffers:     NonNull<NonNull<FramebufferDescriptor>>,
 }
 
 impl FramebufferResponse {
-    pub fn as_slice(&self) -> &[NonNull<FramebufferDescriptor>] {
+    pub fn as_slice(&self) -> &'static [NonNull<FramebufferDescriptor>] {
         let Ok(num_buffers) = usize::try_from(self.num_buffers) else {
             unreachable!("Limine only supports 64-bit systems")
         };
@@ -164,12 +179,13 @@ impl ImplRequest for FramebufferInfo {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct MemoryMapResponse {
     entry_count: u64,
     entries:     NonNull<NonNull<MemoryMapEntry>>,
 }
 impl MemoryMapResponse {
-    pub fn entries(&self) -> &[NonNull<MemoryMapEntry>] {
+    pub fn entries(&self) -> &'static [NonNull<MemoryMapEntry>] {
         let Ok(entry_count) = usize::try_from(self.entry_count) else {
             unreachable!("Limine only supports 64-bit systems")
         };
@@ -178,7 +194,7 @@ impl MemoryMapResponse {
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct MemoryMapEntry {
     pub base:   u64,
     pub length: u64,
@@ -186,7 +202,7 @@ pub struct MemoryMapEntry {
 }
 
 #[repr(u64)]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryMapEntryType {
     Usable = 0,
     Reserved = 1,
@@ -209,6 +225,7 @@ impl ImplRequest for MemoryMap {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct RdspResponse {
     pub address: NonNull<c_void>,
 }
@@ -222,6 +239,7 @@ impl ImplRequest for RdspRequest {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct HddmResponse {
     pub offset: u64,
 }
@@ -235,6 +253,7 @@ impl ImplRequest for HddmRequest {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct ExecutableAddressResponse {
     pub physical_base: u64,
     pub virtual_base:  u64,

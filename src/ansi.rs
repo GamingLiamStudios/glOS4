@@ -542,6 +542,7 @@ impl SelectGraphicRendition {
             },
             59 => Some(Self::Underline(FontColor::Default)),
 
+            // TODO: Support bright colors
             _ => None,
         }
     }

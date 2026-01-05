@@ -10,12 +10,14 @@ panic = "abort"
 
 [profile.release]
 panic = "abort"
+debug = true
 
 [dependencies]
 acpi = "6.0"
 raw-cpuid = "11.6"
 x86_64 = "0.15"
 pci_types = "0.10"
+volatile = "0.6"
 
 spin = "0.10"
 bytemuck = "1.24"

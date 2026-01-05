@@ -4,7 +4,7 @@
 rm -r iso_root image.iso
 
 # Ensure latest build
-cargo build
+cargo build --release
 make -C limine
 
 # Create a directory which will be our ISO root.
@@ -12,7 +12,7 @@ mkdir -p iso_root
 
 # Copy the relevant files over.
 mkdir -p iso_root/boot
-cp -v target/x86_64-unknown-glos/debug/glOS.elf iso_root/boot/glOS
+cp -v target/x86_64-unknown-glos/release/glOS.elf iso_root/boot/glOS
 mkdir -p iso_root/boot/limine
 cp -v limine.conf limine/limine-bios.sys limine/limine-bios-cd.bin \
       limine/limine-uefi-cd.bin iso_root/boot/limine/

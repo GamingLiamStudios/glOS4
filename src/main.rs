@@ -790,6 +790,29 @@ fn enumerate_pci_devices<H: acpi::Handler + ConfigRegionAccess>(
             let (vendor, _device) = header.id(handler);
             vendor != 0xffff
         })
+        .flat_map(move |header| {
+            let function_range = if header.has_multiple_functions(handler) {
+                0..8
+            } else {
+                0..1
+            };
+
+            let current_addr = header.address();
+            function_range
+                .map(move |function| {
+                    PciAddress::new(
+                        current_addr.segment(),
+                        current_addr.bus(),
+                        current_addr.device(),
+                        function,
+                    )
+                })
+                .map(PciHeader::new)
+                .filter(move |header| {
+                    let (vendor, _device) = header.id(handler);
+                    vendor != 0xffff
+                })
+        })
 }
 
 unsafe fn enable_fpu() {
@@ -900,6 +923,7 @@ extern "C" fn _start() -> ! {
         }
     }
 
-    #[allow(clippy::empty_loop)]
-    loop {}
+    loop {
+        println!("bitch");
+    }
 }
