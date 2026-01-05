@@ -7,12 +7,7 @@ use core::{
 
 use bitvec::boxed::BitBox;
 use num_traits::float::FloatCore;
-use rgb::{
-    ColorComponentMap,
-    ComponentMap,
-    Rgb,
-    Rgba,
-};
+use rgb::Rgba;
 use swash::{
     FontRef,
     scale::{
@@ -86,19 +81,6 @@ impl PixelLayout {
             },
         }
     }
-}
-
-#[derive(Debug)]
-pub struct Owned<'a> {
-    data: &'a [u8],
-
-    pitch:  usize,
-    width:  usize,
-    height: usize,
-
-    /// Layout of [`data`](Self::data)
-    pixel_layout:   PixelLayout,
-    bits_per_pixel: u16,
 }
 
 #[derive(Debug)]
@@ -181,8 +163,9 @@ impl UefiFramebuffer {
         }
 
         let dst_pitch = u64_to_usize(active_mode.pitch);
-        let dst_layout = PixelLayout::from_descriptor(active_mode);
+        let _dst_layout = PixelLayout::from_descriptor(active_mode);
 
+        // TODO: Properly implement pixel blit
         if active_mode.bits_per_pixel == buffer.bits_per_pixel {
             let Some(bytes_per_pixel) = active_mode.bits_per_pixel.div_exact(8) else {
                 todo!("UefiFramebuffer::blit_buffer doesn't support non-byte-aligned PixelLayouts");
@@ -213,10 +196,10 @@ macro_rules! print {
 #[macro_export]
 macro_rules! println {
     () => {
-        $crate::print!("\r\n");
+        $crate::print!("\n");
     };
     ($($args:tt)*) => {
-        $crate::print!("{}\r\n", format_args!($($args)*));
+        $crate::print!("{}\n", format_args!($($args)*));
     };
 }
 
@@ -232,7 +215,7 @@ fn downcast_f32_to_usize(value: f32) -> usize {
 }
 
 // ASCII escape codes only support 24-bit color
-type Color = rgb::RGB<u8>;
+type Color = rgb::Rgb<u8>;
 
 #[derive(Debug, Clone, Copy)]
 struct CharCell {
@@ -246,7 +229,7 @@ impl Default for CharCell {
     fn default() -> Self {
         Self {
             char:       ' ',
-            foreground: Color::new(255, 255, 255),
+            foreground: Color::new(u8::MAX, u8::MAX, u8::MAX),
             background: Color::new(0, 0, 0),
         }
     }
@@ -264,65 +247,52 @@ struct KernelLog {
     should_render: bool,
 }
 
-pub const fn alpha_blend_channel(
-    src: u8,
-    dst: u8,
+/// Derived from [Alpha Blending with No Division Operations](https://arxiv.org/pdf/2202.02864)
+#[allow(clippy::cast_possible_truncation)]
+#[inline]
+pub const fn mul_channel_alpha(
+    value: u8,
     alpha: u8,
 ) -> u8 {
-    let src = src as u16;
-    let dst = dst as u16;
-    let alpha = alpha as u16;
+    let alpha = alpha as u32;
+    let value = value as u32;
 
-    let out = (src * alpha + dst * (255 - alpha)) / 255;
-    out as u8
+    // Return value is guarenteed to be within bounds of u8
+    let result = value * alpha + 0x80;
+    ((result + (result >> 8)) >> 8) as u8
 }
 
-#[inline]
-pub const fn blend_rgb8(
-    src: Rgb<u8>,
-    dst: Rgb<u8>,
-    alpha: u8,
-) -> Rgb<u8> {
-    let a = alpha as u16;
-    let inv_a = 255 - a;
-
-    Rgb {
-        r: ((src.r as u16 * a + dst.r as u16 * inv_a) / 255) as u8,
-        g: ((src.g as u16 * a + dst.g as u16 * inv_a) / 255) as u8,
-        b: ((src.b as u16 * a + dst.b as u16 * inv_a) / 255) as u8,
+pub const fn premul_rgba(value: Rgba<u8>) -> Rgba<u8> {
+    let alpha = value.a;
+    Rgba {
+        r: mul_channel_alpha(value.r, alpha),
+        g: mul_channel_alpha(value.g, alpha),
+        b: mul_channel_alpha(value.b, alpha),
+        a: alpha,
     }
 }
 
+/// Blends `above` over `below`. Expects premultiplied colors
 #[inline]
 pub const fn blend_rgba(
-    src: Rgba<u8>,
-    dst: Rgba<u8>,
+    above: Rgba<u8>,
+    below: Rgba<u8>,
 ) -> Rgba<u8> {
-    let sa = src.a as u16;
-    let da = dst.a as u16;
-
-    let out_a = sa + (da * (255 - sa) + 127) / 255;
-
-    if out_a == 0 {
-        return Rgba {
-            r: 0,
-            g: 0,
-            b: 0,
-            a: 0,
-        };
-    }
-
-    let r = (src.r as u16 * sa + dst.r as u16 * da * (255 - sa) / 255) / out_a;
-
-    let g = (src.g as u16 * sa + dst.g as u16 * da * (255 - sa) / 255) / out_a;
-
-    let b = (src.b as u16 * sa + dst.b as u16 * da * (255 - sa) / 255) / out_a;
+    let inv_alpha = u8::MAX - above.a;
 
     Rgba {
-        r: r as u8,
-        g: g as u8,
-        b: b as u8,
-        a: out_a as u8,
+        r: above
+            .r
+            .saturating_add(mul_channel_alpha(below.r, inv_alpha)),
+        g: above
+            .g
+            .saturating_add(mul_channel_alpha(below.g, inv_alpha)),
+        b: above
+            .b
+            .saturating_add(mul_channel_alpha(below.b, inv_alpha)),
+        a: above
+            .a
+            .saturating_add(mul_channel_alpha(below.a, inv_alpha)),
     }
 }
 
@@ -389,13 +359,28 @@ impl KernelLog {
         start: (usize, usize),
         end: (usize, usize),
     ) {
-        todo!("Implement Region Wipe")
+        // TODO: Add bounds check
+        let (width, _height) = self.size;
+
+        let mut cursor = start;
+        while cursor != end {
+            let (x, y) = cursor;
+            self.cells[y * width + x] = CharCell::default();
+            self.dirty.set(y * width + x, true);
+
+            if x == width {
+                cursor = (0, y + 1);
+            } else {
+                cursor = (x + 1, y);
+            }
+        }
     }
 
     fn scroll_up(
         &mut self,
         amount: isize,
     ) {
+        // TODO: Add bounds check
         let (width, height) = self.size;
 
         if amount > 0 {
@@ -425,10 +410,16 @@ impl KernelLog {
 
         match mode {
             SelectGraphicRendition::Background(color) => {
-                cell.background = color.as_rgb();
+                cell.background = color.as_rgb(Color::new(0, 0, 0));
             },
             SelectGraphicRendition::Foreground(color) => {
-                cell.foreground = color.as_rgb();
+                cell.foreground = color.as_rgb(Color::new(255, 255, 255));
+            },
+            SelectGraphicRendition::Reset => {
+                *cell = CharCell {
+                    char: cell.char,
+                    ..CharCell::default()
+                }
             },
             _ => {}, // Not Yet Implemented
         }
@@ -463,6 +454,8 @@ impl KernelLog {
             .render(&mut scaler, glyph_id)
             .expect("Failed to render glyph");
 
+            // TODO: Ensure this is properly handled
+            #[allow(clippy::cast_possible_truncation)]
             let origin = font.metrics(&[]).scale(self.ppem).ascent as isize;
 
             let cell_width = self.framebuffer.width / width;
@@ -479,8 +472,9 @@ impl KernelLog {
             let glyph_x = (cell_width * cell_x).saturating_add_signed(glyph_left);
             let glyph_y = (cell_height * cell_y).saturating_sub_signed(glyph_top - origin);
 
+            let background_color = premul_rgba(cell.background.with_alpha(u8::MAX));
             match image.content {
-                Content::SubpixelMask => unimplemented!(),
+                Content::SubpixelMask => unimplemented!("Swash returned unexpected SubpixelMask"),
                 Content::Color => {
                     let glyph_width = image.placement.width as usize;
                     let row_size = glyph_width * 4;
@@ -488,10 +482,12 @@ impl KernelLog {
                         for (pixel_x, pixel) in row.chunks_exact(4).enumerate() {
                             let x = glyph_x + pixel_x;
                             let y = glyph_y + pixel_y;
-                            let color: &Rgba<u8> = bytemuck::from_bytes(pixel);
+
+                            let raw_color = *bytemuck::from_bytes(pixel);
+                            let premul_fg = premul_rgba(raw_color);
 
                             let pixel = &mut framebuffer[y * self.framebuffer.width + x];
-                            *pixel = blend_rgba(*color, *pixel);
+                            *pixel = blend_rgba(premul_fg, background_color);
                         }
                     }
                 },
@@ -500,17 +496,18 @@ impl KernelLog {
                     let glyph_height = image.placement.height as usize;
 
                     let mut i = 0;
-                    let bc = cell.foreground;
+                    let foreground_color = cell.foreground;
                     for pixel_y in 0..glyph_height {
                         for pixel_x in 0..glyph_width {
                             let x = glyph_x + pixel_x;
                             let y = glyph_y + pixel_y;
 
                             let alpha = image.data[i];
-                            let color = bc.with_alpha(alpha);
+                            let raw_color = foreground_color.with_alpha(alpha);
+                            let premul_fg = premul_rgba(raw_color);
 
                             let pixel = &mut framebuffer[y * self.framebuffer.width + x];
-                            *pixel = blend_rgba(color, *pixel);
+                            *pixel = blend_rgba(premul_fg, background_color);
                             i += 1;
                         }
                     }
@@ -571,9 +568,8 @@ pub fn print(args: fmt::Arguments<'_>) {
                 kernel_log.cursor = (core::cmp::min(x.next_multiple_of(TAB_WIDTH), width), y);
             }, // Tab
             '\n' => {
-                // Takes the most literal approach and only increments y (for now)
-                let (x, y) = kernel_log.cursor;
-                kernel_log.cursor = (x, core::cmp::max(y + 1, height));
+                let (_x, y) = kernel_log.cursor;
+                kernel_log.cursor = (0, core::cmp::min(y + 1, height));
             }, // Line Feed
             '\r' => {
                 let (_, y) = kernel_log.cursor;
@@ -586,26 +582,26 @@ pub fn print(args: fmt::Arguments<'_>) {
                 let Ok((remain, seq)) = ansi::parse_control_sequence(seq_start) else {
                     continue;
                 };
-                _ = chars.advance_by(seq_start.len() - remain.len());
+                _ = chars.advance_by(seq_start.len() - remain.len() - 1);
 
                 match seq {
                     ControlSequence::DeviceStatus => unimplemented!("stdin doesn't exist"),
                     ControlSequence::CursorMoveDir { dir, amt } => {
                         let (x, y) = kernel_log.cursor;
                         match dir {
-                            Direction::Up => kernel_log.cursor = (x, y.saturating_sub(1)),
-                            Direction::Down => kernel_log.cursor = (x, min(y + 1, height)),
+                            Direction::Up => kernel_log.cursor = (x, y.saturating_sub(amt)),
+                            Direction::Down => kernel_log.cursor = (x, min(y + amt, height)),
 
-                            Direction::Forward => kernel_log.cursor = (min(x + 1, width), y),
-                            Direction::Back => kernel_log.cursor = (x.saturating_sub(1), y),
+                            Direction::Forward => kernel_log.cursor = (min(x + amt, width), y),
+                            Direction::Back => kernel_log.cursor = (x.saturating_sub(amt), y),
                         }
                     },
                     ControlSequence::CursorMoveLine { dir, amt } => {
-                        let (x, y) = kernel_log.cursor;
+                        let (_x, y) = kernel_log.cursor;
                         match dir {
                             Direction::Forward | Direction::Back => unreachable!(),
-                            Direction::Down => kernel_log.cursor = (0, min(y + 1, height)),
-                            Direction::Up => kernel_log.cursor = (0, y.saturating_sub(1)),
+                            Direction::Down => kernel_log.cursor = (0, min(y + amt, height)),
+                            Direction::Up => kernel_log.cursor = (0, y.saturating_sub(amt)),
                         }
                     },
                     ControlSequence::CursorSet { x, y } => {

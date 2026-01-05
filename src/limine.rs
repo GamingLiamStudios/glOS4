@@ -121,12 +121,14 @@ impl FramebufferResponse {
 }
 
 #[repr(u8)]
+#[derive(Debug)]
 pub enum FramebufferMemoryModel {
     Rgb = 1,
 }
 
 // TODO: Document
 #[repr(C)]
+#[derive(Debug)]
 pub struct FramebufferDescriptor {
     pub address: NonNull<u8>,
 

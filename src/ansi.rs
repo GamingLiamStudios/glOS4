@@ -47,7 +47,7 @@ pub enum ControlSequence {
 #[allow(clippy::too_many_lines)] // FIXME
 pub fn parse_control_sequence(sequence: &str) -> IResult<&str, ControlSequence> {
     preceded(
-        tag("\x3B["),
+        tag("\x1B["),
         (
             separated_list0(char(';'), digit0.map(|v: &str| v.parse::<usize>().ok())),
             take(1usize),
@@ -272,7 +272,10 @@ pub enum FontColor {
 }
 
 impl FontColor {
-    pub fn as_rgb(self) -> Rgb<u8> {
+    pub fn as_rgb(
+        self,
+        default: Rgb<u8>,
+    ) -> Rgb<u8> {
         match self {
             Self::TrueColor(color) => color,
             Self::Ega(ega_color) => {
@@ -289,9 +292,9 @@ impl FontColor {
                 }
             },
             Self::Lut(_selector) => {
-                todo!("Support Lut Font Colors")
+                todo!("256-bit Font Colors currently unsupported")
             },
-            Self::Default => Rgb::default(),
+            Self::Default => default,
         }
     }
 }

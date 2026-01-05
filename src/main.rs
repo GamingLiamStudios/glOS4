@@ -55,7 +55,10 @@ use x86_64::{
     },
 };
 
-use crate::limine::MemoryMapEntryType;
+use crate::{
+    framebuffer::FRAMEBUFFER,
+    limine::MemoryMapEntryType,
+};
 
 mod ansi;
 mod framebuffer;
@@ -826,12 +829,17 @@ extern "C" fn _start() -> ! {
 
     assert!(
         BASE_REVISION.is_supported(),
-        "Base Revision is not Supported!"
+        "Limine Base Revision is not Supported!"
     );
 
-    println!("Hello World!");
+    println!("\x1B[32mHello World!\x1B[0m");
 
     unsafe {
+        {
+            let framebuffer = FRAMEBUFFER.lock();
+            println!("{:#?}", framebuffer.active_mode());
+        }
+
         let Some(_memory_map) = MEMORY_MAP.response() else {
             panic!("Unable to get MemoryMap from Limine");
         };
